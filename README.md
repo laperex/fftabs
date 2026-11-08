@@ -1,79 +1,80 @@
-# fftabs 🦊
+# fftabs
 
-> **Ultra-fast, multi-profile Firefox tab switcher and manager for Linux desktop environments and window managers.**
+Multi-profile Firefox tab switcher and manager for Linux desktop environments and window managers.
 
-Switch, search, and close tabs across multiple Firefox windows and profiles from **Rofi**, **dmenu**, or the shell — with high-resolution favicons, multi-profile awareness, deterministic compositor window focusing, and **zero background daemons**. Built entirely with the **Python 3 standard library**.
+Switch, search, and close tabs across multiple Firefox windows and profiles from **Rofi**, **dmenu**, or the shell — featuring cached favicon support, multi-profile awareness, deterministic compositor window focusing, and no background daemons. Implemented entirely with the **Python 3 standard library**.
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
-- [Overview & Architecture](#-overview--architecture)
-- [Key Features](#-key-features)
-- [Prerequisites](#-prerequisites)
-- [Installation](#-installation)
-  - [1. Install CLI & Native Messaging Host](#1-install-cli--native-messaging-host)
+- [Overview and Architecture](#overview-and-architecture)
+- [Key Features](#key-features)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+  - [1. Install CLI and Native Messaging Host](#1-install-cli-and-native-messaging-host)
   - [2. Install the Firefox Extension](#2-install-the-firefox-extension)
-  - [3. Verify the Setup](#3-verify-the-setup)
-- [Usage Guide](#-usage-guide)
+  - [3. Verify the Pipeline](#3-verify-the-pipeline)
+- [Usage Guide](#usage-guide)
   - [Interactive Rofi Switcher](#interactive-rofi-switcher)
-  - [Command-Line Scripting & JSON](#command-line-scripting--json)
-  - [Custom Themes (VS Code Palette included)](#custom-themes)
-- [Window Manager Keybindings](#-window-manager-keybindings)
-- [How It Works Under the Hood](#-how-it-works-under-the-hood)
-- [Troubleshooting](#-troubleshooting)
-- [Contributing](#-contributing)
-- [License](#-license)
+  - [Command-Line Scripting and JSON](#command-line-scripting-and-json)
+  - [Custom Themes](#custom-themes)
+- [Auto-Updates for Self-Hosted Extensions](#auto-updates-for-self-hosted-extensions)
+- [Window Manager Keybindings](#window-manager-keybindings)
+- [Technical Architecture](#technical-architecture)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
-## 🔍 Overview & Architecture
+## Overview and Architecture
 
-Firefox does not provide an external IPC or D-Bus API for external applications to query or switch tabs. `fftabs` solves this cleanly using Firefox's sanctioned **Native Messaging** protocol:
+Firefox does not provide an external IPC or D-Bus interface for external processes to query or switch tabs. `fftabs` resolves this using Firefox's standard **Native Messaging** protocol:
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│  Firefox Browser (Profile A, Profile B, ...)                           │
-│  └── extension/ (Tabs API)                                             │
-│        │  Native Messaging (32-bit length-prefixed JSON via stdio)     │
-│        ▼                                                               │
-│  fftabs host (Spawned automatically by Firefox)                        │
-│        │  Exposes per-user Unix Domain Socket (mode 0600)              │
-│        ▼  $XDG_RUNTIME_DIR/fftabs-<firefox_pid>.sock                   │
-└────────┬───────────────────────────────────────────────────────────────┘
++------------------------------------------------------------------------+
+|  Firefox Browser (Profile A, Profile B, ...)                           |
+|  └── extension/ (Tabs API)                                             |
+|        │  Native Messaging (32-bit length-prefixed JSON via stdio)     |
+|        ▼                                                               |
+|  fftabs host (Spawned automatically by Firefox)                        |
+|        │  Exposes per-user Unix Domain Socket (mode 0600)              |
+|        ▼  $XDG_RUNTIME_DIR/fftabs-<firefox_pid>.sock                   |
++--------┬---------------------------------------------------------------+
          │
          │  JSON-RPC over Unix Socket
          ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│  fftabs CLI / Rofi Front-end                                           │
-│  ├── Query & aggregate tabs across all active profiles                 │
-│  ├── Display interactive picker with cached favicons & metadata        │
-│  ├── Activate selected tab via extension RPC                           │
-│  └── Deterministically focus compositor window (Niri / Sway / Hyprland)│
-└────────────────────────────────────────────────────────────────────────┘
++------------------------------------------------------------------------+
+|  fftabs CLI / Rofi Front-end                                           |
+|  ├── Query & aggregate tabs across all active profiles                 |
+|  ├── Display interactive picker with cached favicons & metadata        |
+|  ├── Activate selected tab via extension RPC                           |
+|  └── Deterministically focus compositor window (Niri / Sway / Hyprland)|
++------------------------------------------------------------------------+
 ```
 
-Everything runs strictly on your local machine. No external services, no analytics, no persistent memory footprint when not in use.
+All IPC operations take place locally through Unix domain sockets. No network services, background polling loops, or third-party dependencies are required.
 
 ---
 
-## ✨ Key Features
+## Key Features
 
-- ⚡ **Zero Dependencies / Pure Python Standard Library**: No pip packages required to run the core CLI, native messaging host, or tab switcher.
-- 👥 **Multi-Profile Native**: Automatically discovers profile names by querying Firefox's internal Profile Groups SQLite database and active file descriptors. Prefix tags like `work/win 1` make navigation seamless.
-- 🎯 **Deterministic Compositor Focusing**: Eliminates window-switching ambiguity by filtering windows by `firefox_pid` before matching titles. First-class support for **Niri**, **Sway**, **Hyprland**, and **X11**.
-- 🖼️ **Favicons & Rich Metadata**: Downloads and caches tab favicons to display alongside tab titles. Shows container names (Work, Personal, etc.), audio playback state, mute status, pinned state, and unloaded/discarded status.
-- ⌨️ **Interactive Controls**: In Rofi, press **Enter** to switch to a tab, or press **Alt+d** to close the highlighted tab in-place without dismissing the menu.
-- 🔁 **Alt-Tab Behavior**: Supports `--previous` to immediately preselect the last active tab, giving you an instantaneous keyboard-driven tab switcher.
-- 🛠️ **Fully Scriptable**: Outputs tab lists in tab-separated values (TSV) or raw JSON for integration into custom shell scripts, Waybar modules, or polybar widgets.
+- **Pure Python Standard Library**: Core CLI, native messaging host, and tab management require only Python 3.8+ with no external packages.
+- **Multi-Profile Native**: Automatically discovers profile names by inspecting Firefox's active file descriptors and internal Profile Groups SQLite database (`Profile Groups/*.sqlite`). Profile tags (e.g. `work/win 1`) allow clear visual disambiguation.
+- **Deterministic Window Focusing**: Resolves window activation on Wayland (**Niri**, **Sway**, **Hyprland**) and **X11** by matching the Firefox process PID before matching window titles, preventing focus collisions when different profiles have tabs with identical titles.
+- **Favicons and Tab Metadata**: Downloads and caches tab favicons to display alongside tab titles. Shows container names (Work, Personal, etc.), audio state, mute status, pinned state, and unloaded/discarded state.
+- **In-Place Tab Actions**: Press **Enter** to switch to a tab, or **Alt+d** to close the selected tab directly in the picker without dismissing the menu.
+- **Alt-Tab Switching Workflow**: Supports `--previous` to preselect the most recently used tab, enabling seamless keyboard-driven back-and-forth tab switching.
+- **Scriptable Interface**: Supports tab-separated values (TSV) and structured JSON outputs for integration into status bars (Waybar, Polybar), shell scripts, and external tools.
 
 ---
 
-## 📦 Prerequisites
+## Prerequisites
 
 - **Python 3.8+**
 - **Firefox** (Standard Release, Developer Edition, Nightly, or ESR)
-- **Rofi** or **rofi-wayland** (optional, required for the GUI picker)
+- **Rofi** or **rofi-wayland** (optional, required for the interactive graphical picker)
 - **python-pillow** (optional, recommended for converting ICO/WEBP favicons to PNG for Rofi)
 
 On Arch Linux:
@@ -83,17 +84,17 @@ sudo pacman -S python rofi-wayland python-pillow
 
 ---
 
-## 🚀 Installation
+## Installation
 
-### 1. Install CLI & Native Messaging Host
+### 1. Install CLI and Native Messaging Host
 
-Clone this repository and register the native messaging host:
+Clone the repository and register the native messaging host:
 
 ```bash
 git clone https://github.com/krishnadev7777/firefox_tab_switcher.git
 cd firefox_tab_switcher
 
-# Register host wrapper in ~/.local/share/fftabs/ and manifest in ~/.mozilla/native-messaging-hosts/
+# Registers host wrapper in ~/.local/share/fftabs/ and manifest in ~/.mozilla/native-messaging-hosts/
 ./fftabs install
 
 # Symlink fftabs into your user PATH
@@ -103,16 +104,16 @@ ln -sf "$PWD/fftabs" ~/.local/bin/fftabs
 
 ### 2. Install the Firefox Extension
 
-Choose the method matching your Firefox setup:
+Choose the method that matches your environment:
 
-#### Option A: Install from Signed XPI (Standard Firefox Release)
-If you have generated or downloaded a signed `.xpi` (via Mozilla AMO):
-1. Open Firefox and drag-and-drop the `.xpi` file into any Firefox window (or press `Ctrl+O` and select the file).
+#### Option A: Install from a Signed XPI (Standard Firefox Release)
+If you have generated or downloaded a signed `.xpi`:
+1. Open Firefox and drag-and-drop the `.xpi` file into any Firefox window (or open it with `firefox <path-to-.xpi>`).
 2. Click **Add** when prompted.
-3. Open `about:addons` → click **fftabs** → check **"Allow in Private Windows"** if you want private browsing tabs to appear in the switcher.
+3. Open `about:addons` -> click **fftabs** -> check **"Allow in Private Windows"** if you want private browsing tabs to appear in the switcher.
 
 #### Option B: Self-Signing with web-ext (For Personal Use on Stock Firefox)
-Mozilla allows instantaneous automated signing for personal unlisted extensions:
+Mozilla allows automated signing for personal unlisted extensions:
 ```bash
 npx web-ext sign \
   --source-dir extension \
@@ -120,17 +121,18 @@ npx web-ext sign \
   --api-key="YOUR_AMO_JWT_ISSUER" \
   --api-secret="YOUR_AMO_JWT_SECRET"
 ```
-The signed `.xpi` will be output to `./web-ext-artifacts/`. Install it via `about:addons` → ⚙ → *Install Add-on From File...*.
+The signed `.xpi` will be written to `./web-ext-artifacts/`. Install it in Firefox via `about:addons` -> gear icon -> *Install Add-on From File...*.
 
 #### Option C: Temporary Loading (Quick Testing)
-1. Open `about:debugging#/runtime/this-firefox` in Firefox.
+1. Navigate to `about:debugging#/runtime/this-firefox` in Firefox.
 2. Click **Load Temporary Add-on...**.
 3. Select `extension/manifest.json`.
-*(Note: Temporary add-ons are cleared when Firefox completely exits).*
 
-### 3. Verify the Setup
+*(Note: Temporary add-ons are unloaded when Firefox exits).*
 
-Run `fftabs status` to verify the entire connection pipeline:
+### 3. Verify the Pipeline
+
+Run `fftabs status` to verify end-to-end communication:
 
 ```bash
 fftabs status
@@ -149,15 +151,15 @@ firefox         : host pid 711732  ok  profile=personal
 
 ---
 
-## 💡 Usage Guide
+## Usage Guide
 
 ### Interactive Rofi Switcher
 
 ```bash
-# Launch interactive tab picker (most recently used order)
+# Launch interactive tab picker (most recently accessed order)
 fftabs
 
-# Preselect the previously active tab (ideal for binding to Alt+Tab or Super+Tab)
+# Preselect the previously active tab (ideal for Alt+Tab shortcuts)
 fftabs rofi --previous
 
 # Order tabs by window and position rather than recent usage
@@ -172,14 +174,14 @@ fftabs rofi -- -theme ~/.config/rofi/my-theme.rasi
 
 #### Keyboard Shortcuts in Rofi:
 - **`Enter`**: Switch to the highlighted tab and focus its containing window.
-- **`Alt+d`**: Close the highlighted tab in the background and keep the picker open on the next row.
+- **`Alt+d`**: Close the highlighted tab in the background without dismissing the picker.
 - **`Esc`**: Dismiss the switcher.
 
 ---
 
-### Command-Line Scripting & JSON
+### Command-Line Scripting and JSON
 
-`fftabs` is designed to be easily integrated into shell scripts, automation pipelines, and status bars:
+`fftabs` provides machine-readable outputs for shell scripts and status bars:
 
 ```bash
 # List all tabs (tab-separated: ref, profile, window, current, title, url)
@@ -188,10 +190,10 @@ fftabs list
 # Output full tab structure as JSON
 fftabs list --json
 
-# Filter tabs using jq
+# Filter tabs using jq (e.g. audible tabs)
 fftabs list --json | jq '.[] | select(.audible == true) | {title, profile: ._profile_name}'
 
-# Programmatically switch to a tab by ref (e.g. bare ID, or profile:ID)
+# Programmatically switch to a tab by ref (bare ID, or profile:ID)
 fftabs switch 42
 fftabs switch work:42
 
@@ -203,7 +205,7 @@ fftabs close work:42
 
 ### Custom Themes
 
-A VS Code Command Palette-style Rofi theme (`vscode.rasi`) is included in the root of the repository:
+A VS Code Command Palette-style theme (`vscode.rasi`) is included in the repository:
 
 ```bash
 fftabs rofi -- -theme ./vscode.rasi
@@ -211,9 +213,58 @@ fftabs rofi -- -theme ./vscode.rasi
 
 ---
 
-## ⌨️ Window Manager Keybindings
+## Auto-Updates for Self-Hosted Extensions
 
-Bind `fftabs` to a keyboard shortcut for instant access:
+If you distribute or self-host your signed extension outside the public addons.mozilla.org directory, you can configure automatic updates so Firefox checks for and installs new releases automatically.
+
+### 1. Configure `update_url` in `manifest.json`
+
+In `extension/manifest.json`, add the `update_url` property pointing to a hosted `updates.json` manifest:
+
+```json
+{
+  "manifest_version": 2,
+  "name": "fftabs",
+  "version": "0.1.3",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "fftabs@krishnadev7777",
+      "strict_min_version": "140.0",
+      "update_url": "https://raw.githubusercontent.com/krishnadev7777/firefox_tab_switcher/main/updates.json"
+    }
+  }
+}
+```
+
+### 2. Create the `updates.json` Manifest
+
+Place an `updates.json` file in your repository root or hosting server using Mozilla's update manifest schema:
+
+```json
+{
+  "addons": {
+    "fftabs@krishnadev7777": {
+      "updates": [
+        {
+          "version": "0.1.3",
+          "update_link": "https://github.com/krishnadev7777/firefox_tab_switcher/releases/download/v0.1.3/fftabs-0.1.3.xpi"
+        }
+      ]
+    }
+  }
+}
+```
+
+### 3. How Auto-Update Verification Works
+- Firefox periodically fetches `update_url` over HTTPS.
+- When `version` in `updates.json` is greater than the installed version, Firefox downloads the `.xpi` from `update_link`.
+- Firefox verifies that the downloaded `.xpi` is signed by Mozilla with the same extension ID (`id`), then installs the update in the background.
+
+*(Note: If you publish your extension publicly on addons.mozilla.org, AMO handles updates automatically and `update_url` is not required).*
+
+---
+
+## Window Manager Keybindings
 
 ### Niri (`~/.config/niri/config.kdl`)
 ```kdl
@@ -237,64 +288,63 @@ bind = $mainMod SHIFT, Tab, exec, fftabs rofi
 
 ---
 
-## ⚙️ How It Works Under the Hood
+## Technical Architecture
 
-### 1. WebExtension & Native Messaging Bridge
-When Firefox starts with the extension enabled, it connects to the native messaging host defined in `~/.mozilla/native-messaging-hosts/fftabs.json`. Firefox launches `./fftabs host` as a child process and communicates via standard input/output using 32-bit length-prefixed JSON payloads.
+### 1. WebExtension and Native Messaging Bridge
+When Firefox launches with the extension installed, it connects to the native messaging host configured at `~/.mozilla/native-messaging-hosts/fftabs.json`. Firefox starts `./fftabs host` as a subprocess and communicates via standard I/O using 32-bit length-prefixed JSON messages.
 
 ### 2. IPC Sockets
-The `fftabs host` creates a Unix domain socket at `$XDG_RUNTIME_DIR/fftabs-<firefox_pid>.sock` with file mode `0600` (readable/writable only by your Linux user account). When you invoke the `fftabs` CLI, it queries all active sockets concurrently with a 5-second timeout, aggregating tabs across all running Firefox profiles.
+The `fftabs host` establishes a Unix domain socket at `$XDG_RUNTIME_DIR/fftabs-<firefox_pid>.sock` with file mode `0600` (restricted to the current Linux user). When the `fftabs` CLI is invoked, it queries all active sockets concurrently with a 5-second timeout, aggregating tabs across all active Firefox profiles.
 
 ### 3. Profile Discovery
-Rather than requiring the user to manually configure profile names or modify extension code, `fftabs` automatically inspects `/proc/<firefox_pid>/fd` to discover the active profile directory lock (`.parentlock`), then queries Firefox's `Profile Groups/*.sqlite` database or `profiles.ini` to resolve human-readable profile names (e.g. `work`, `personal`).
+Rather than requiring manual profile configuration, `fftabs` inspects `/proc/<firefox_pid>/fd` to find the active profile directory lock (`.parentlock`), then queries Firefox's `Profile Groups/*.sqlite` database or `profiles.ini` to resolve human-readable profile names (such as `work` or `personal`).
 
-### 4. Deterministic Compositor Focusing
-When you select a tab in Rofi, two actions happen:
-1. The extension executes `browser.tabs.update(tabId, { active: true })` and `browser.windows.update(windowId, { focused: true })`.
-2. To bring the Firefox window to the foreground in Wayland or X11, `fftabs` queries the active window manager (Niri, Sway, Hyprland, or X11 via `wmctrl`/`xdotool`). It first filters windows matching the specific Firefox instance PID, then matches the window title, avoiding misfocusing when multiple profiles have tabs with identical titles.
+### 4. Deterministic Window Focusing
+Selecting a tab in Rofi executes two steps:
+1. The extension issues `browser.tabs.update(tabId, { active: true })` and `browser.windows.update(windowId, { focused: true })`.
+2. To bring the window to the foreground on Wayland or X11, `fftabs` queries the active window manager (Niri, Sway, Hyprland, or X11 via `wmctrl`/`xdotool`). It filters windows matching the target Firefox instance PID before matching the window title, avoiding misfocusing when multiple profiles have tabs with identical titles.
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 ### `fftabs status` reports `firefox: NOT CONNECTED`
-- Make sure Firefox is running.
-- Ensure the extension is loaded and enabled in `about:addons`.
-- Verify that `~/.mozilla/native-messaging-hosts/fftabs.json` exists and points to the correct executable wrapper. Run `./fftabs install` to regenerate it.
-- Check permissions: if Firefox was installed via Flatpak or Snap, native messaging requires host portal permissions (native package installation via `pacman`, `apt`, or `dnf` is recommended).
+- Verify that Firefox is running.
+- Ensure the extension is enabled in `about:addons`.
+- Verify that `~/.mozilla/native-messaging-hosts/fftabs.json` exists and points to the correct wrapper. Run `./fftabs install` to regenerate it.
+- Package isolation: If Firefox is running inside a Flatpak or Snap sandbox, native messaging requires host portal access. A native distribution package (Arch, Debian, Fedora) is recommended.
 
 ### Tabs from Private Windows do not appear
-By default, Firefox restricts extensions from accessing private browsing windows. Open `about:addons` → click **fftabs** → toggle **Run in Private Windows** to **Allow**.
+Firefox restricts extensions from private windows by default. Open `about:addons` -> click **fftabs** -> toggle **Run in Private Windows** to **Allow**.
 
 ### Favicons are missing in Rofi
-- Ensure `show-icons: true;` is present in your Rofi configuration or theme.
-- Install `python-pillow` so ICO and WEBP favicons can be dynamically converted to PNG format for Rofi's icon fetcher.
+- Ensure `show-icons: true;` is enabled in your Rofi configuration or theme.
+- Install `python-pillow` so that ICO and WEBP favicons can be converted to PNG for Rofi's icon cache.
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
-Contributions, bug reports, and suggestions are very welcome!
+Contributions, bug reports, and pull requests are welcome.
 
 ### Development Setup
-1. Fork and clone the repository.
-2. The codebase has **no external build steps** or third-party runtime dependencies:
+1. Clone the repository:
    ```bash
    git clone https://github.com/krishnadev7777/firefox_tab_switcher.git
    cd firefox_tab_switcher
    ```
-3. Run the automated test suite:
+2. Run the test suite:
    ```bash
    python3 -m unittest discover tests/ -v
    ```
 
-### Guidelines
-- **Standard Library Only**: The CLI and host logic must remain runnable with the Python 3 standard library.
-- **Test Coverage**: When adding compositor backends, profile detection logic, or CLI flags, add corresponding unit tests in `tests/`.
-- **Formatting**: Keep Python code clean, typed with type annotations, and formatted.
+### Contribution Guidelines
+- **Standard Library Only**: The CLI and host logic must remain dependency-free using the Python 3 standard library.
+- **Test Coverage**: When adding profile discovery logic, compositor backends, or CLI options, include corresponding unit tests in `tests/`.
+- **Code Style**: Keep Python code cleanly typed, structured, and formatted.
 
 ---
 
-## 📄 License
+## License
 
-This project is open-source software licensed under the [MIT License](file:///home/laperex/Programming/firefox_tab_switcher/LICENSE).
+This project is licensed under the [MIT License](LICENSE).
