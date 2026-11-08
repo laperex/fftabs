@@ -275,6 +275,79 @@ fftabs rofi -- -theme ~/.config/rofi/my-theme.rasi
 
 ---
 
+## Configuration
+
+`fftabs` can be fully customized using a TOML configuration file located at `~/.config/fftabs/config.toml` (or `config.ini`).
+
+### Initialize Default Configuration
+
+Generate a clean, annotated configuration template:
+
+```bash
+# Create ~/.config/fftabs/config.toml with all options and documentation
+fftabs config --init
+
+# Print the path of the active config file
+fftabs config --path
+
+# View the currently active configuration with all defaults resolved
+fftabs config --show
+```
+
+### Complete `config.toml` Reference
+
+```toml
+[general]
+default_sort = "window-recent"                  # "window-recent", "recent", "window-index", "window-num"
+previous = false                                # Preselect previous tab in rofi (Alt+Tab style)
+search_url = "https://duckduckgo.com/?q={query}" # Search query template for new tabs
+# cache_dir = "~/.cache/fftabs"
+# data_dir = "~/.local/share/fftabs"
+
+[rofi]
+# theme = "~/.config/rofi/my-theme.rasi"
+show_icons = true
+allow_network_icons = true                      # false = only cached/data: favicons
+show_tab_position = true                        # Display [#index/total] in tab subtitle
+extra_args = []                                 # e.g. ["-font", "JetBrains Mono 11"]
+
+[keybindings]
+close_tab = "Alt+d"                             # Set to "" to disable
+close_others = "Alt+o"
+close_right = "Alt+r"
+close_left = "Alt+l"
+new_tab = "Alt+n"
+
+[history]
+enabled = true                                  # Set false to disable all history tracking
+# history_file = "~/.cache/fftabs/history.json"
+max_entries = 500
+enable_extension_history = true                 # Query Firefox history API
+enable_session_cache = true                     # Cache opened/closed tabs locally
+exclude_profiles = []                           # Profiles to NEVER record or suggest in history
+exclude_url_patterns = []                       # Regex patterns of URLs to exclude from history
+
+[close]
+confirm_scoped_close = true                     # Preview confirmation dialog before closing in Rofi
+cli_confirm = true                              # Prompt in CLI unless -y is passed
+close_pinned = false                            # Whether scoped close can remove pinned tabs
+
+[new_tab]
+enabled = true                                  # Enable new tab creation
+target_profile = ""                             # "" = auto-detect focused window; or specify profile
+default_url = "about:newtab"
+
+[profiles]
+default_profile = ""                            # "" = show all connected profiles
+ignored_profiles = []                           # Profiles to hide from fftabs entirely
+
+[compositor]
+# focus_cmd = ""                                # Custom command to raise Firefox window
+disable_focus = false
+```
+
+---
+
 ## Auto-Updates for Self-Hosted Extensions
 
 If you distribute or self-host your signed extension outside the public addons.mozilla.org directory, you can configure automatic updates so Firefox checks for and installs new releases automatically.

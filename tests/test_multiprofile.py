@@ -574,5 +574,85 @@ class TestHistoryCache(unittest.TestCase):
                     self.assertEqual(filtered[0]["url"], "https://b.com")
 
 
+class TestConfiguration(unittest.TestCase):
+    def test_default_config_structure(self):
+        cfg = fftabs.load_config(Path("/nonexistent/config.toml"))
+        self.assertEqual(cfg["general"]["default_sort"], "window-recent")
+        self.assertIn("duckduckgo", cfg["general"]["search_url"])
+        self.assertTrue(cfg["history"]["enabled"])
+        self.assertEqual(cfg["keybindings"]["close_tab"], "Alt+d")
+        self.assertEqual(cfg["keybindings"]["close_others"], "Alt+o")
+
+    def test_toml_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg_p = Path(td) / "config.toml"
+            cfg_p.write_text("""
+[general]
+default_sort = "recent"
+search_url = "https://google.com/search?q={query}"
+
+[history]
+enabled = false
+exclude_profiles = ["secret"]
+exclude_url_patterns = ["^https?://internal\\\\.net"]
+
+[keybindings]
+close_tab = "Ctrl+q"
+close_others = ""
+""")
+            cfg = fftabs.load_config(cfg_p)
+            self.assertEqual(cfg["general"]["default_sort"], "recent")
+            self.assertEqual(cfg["general"]["search_url"], "https://google.com/search?q={query}")
+            self.assertFalse(cfg["history"]["enabled"])
+            self.assertEqual(cfg["history"]["exclude_profiles"], ["secret"])
+            self.assertEqual(cfg["keybindings"]["close_tab"], "Ctrl+q")
+            self.assertEqual(cfg["keybindings"]["close_others"], "")
+            # Untouched keys remain at default
+            self.assertEqual(cfg["keybindings"]["close_right"], "Alt+r")
+
+    def test_history_exclude_profiles_and_patterns(self):
+        with tempfile.TemporaryDirectory() as td:
+            mock_cfg = {
+                "history": {
+                    "enabled": True,
+                    "enable_session_cache": True,
+                    "exclude_profiles": ["private-prof"],
+                    "exclude_url_patterns": ["^https?://secret\\.local"],
+                    "history_file": str(Path(td) / "hist.json"),
+                    "max_entries": 100,
+                }
+            }
+            with patch("fftabs.get_config", return_value=mock_cfg):
+                tabs = [
+                    {"url": "https://allowed.com", "title": "Allowed", "_profile_name": "work"},
+                    {"url": "https://secret.local/page", "title": "Secret", "_profile_name": "work"},
+                    {"url": "https://other.com", "title": "Private Tab", "_profile_name": "private-prof"},
+                ]
+                fftabs.record_history(tabs)
+                hfile = Path(td) / "hist.json"
+                self.assertTrue(hfile.exists())
+                recorded = json.loads(hfile.read_text())
+                urls = [r["url"] for r in recorded]
+                self.assertEqual(urls, ["https://allowed.com"])
+
+    def test_config_init(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch("fftabs.config_dir", return_value=Path(td)):
+                class Args:
+                    init = True
+                    path = False
+                    show = False
+                    force = False
+
+                ret = fftabs.cmd_config(Args(), [])
+                self.assertEqual(ret, 0)
+                cfg_file = Path(td) / "config.toml"
+                self.assertTrue(cfg_file.exists())
+                import tomllib
+                parsed = tomllib.loads(cfg_file.read_text(encoding="utf-8"))
+                self.assertIn("general", parsed)
+                self.assertIn("keybindings", parsed)
+
+
 if __name__ == "__main__":
     unittest.main()

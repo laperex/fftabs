@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import configparser
+import copy
 import hashlib
 import html
 import io
@@ -32,6 +33,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
 HOST_NAME = "fftabs"
 ALLOWED_EXTENSIONS = ["fftabs@laperex"]
 DEFAULT_MANIFEST_DIR = "~/.mozilla/native-messaging-hosts"
@@ -39,18 +45,241 @@ FALLBACK_ICON = "firefox"  # icon-theme name used when a tab has no usable favic
 
 
 # ----------------------------------------------------------------------------
-# paths / small helpers
+# configuration (~/.config/fftabs/config.toml)
 # ----------------------------------------------------------------------------
+
+CONFIG_TEMPLATE = """# fftabs configuration file (~/.config/fftabs/config.toml)
+
+[general]
+# Default sort order: "window-recent", "recent", "window-index", "window-num"
+default_sort = "window-recent"
+
+# Preselect the previous tab in rofi (Alt-Tab style)
+previous = false
+
+# Default search engine URL template for queries that are not URLs
+search_url = "https://duckduckgo.com/?q={query}"
+
+# Custom cache and data directories (uncomment to override XDG defaults)
+# cache_dir = "~/.cache/fftabs"
+# data_dir = "~/.local/share/fftabs"
+
+[rofi]
+# Path to a custom .rasi theme
+# theme = "~/.config/rofi/my-theme.rasi"
+
+# Show website favicons
+show_icons = true
+
+# Allow downloading favicons over the network (false = cached/data: only)
+allow_network_icons = true
+
+# Show tab position within the window, e.g. [#3/8]
+show_tab_position = true
+
+# Extra arguments passed directly to rofi
+# extra_args = ["-font", "JetBrains Mono 11"]
+
+[keybindings]
+# Keybindings inside rofi. Set to "" to disable a shortcut.
+close_tab = "Alt+d"
+close_others = "Alt+o"
+close_right = "Alt+r"
+close_left = "Alt+l"
+new_tab = "Alt+n"
+
+[history]
+# Enable history recording and autocomplete
+enabled = true
+
+# Custom path to local history cache file
+# history_file = "~/.cache/fftabs/history.json"
+
+# Maximum entries to keep in history
+max_entries = 500
+
+# Query Firefox browsing history via extension API
+enable_extension_history = true
+
+# Cache opened and closed tabs locally
+enable_session_cache = true
+
+# List of profile names or slugs to exclude from history
+exclude_profiles = []
+
+# List of regex patterns for URLs to exclude from history
+exclude_url_patterns = []
+
+[close]
+# Show confirmation preview before closing scoped tabs in Rofi
+confirm_scoped_close = true
+
+# Prompt for confirmation in CLI commands unless -y is given
+cli_confirm = true
+
+# Allow scoped close operations to close pinned tabs
+close_pinned = false
+
+[new_tab]
+# Enable new tab creation from Rofi and CLI
+enabled = true
+
+# Force new tabs into a specific profile ("" = auto-detect focused window)
+target_profile = ""
+
+# Default URL when opening a new tab without query
+default_url = "about:newtab"
+
+[profiles]
+# Show only this profile by default ("" = show all)
+default_profile = ""
+
+# Completely ignore and hide these profiles from fftabs
+ignored_profiles = []
+
+[compositor]
+# Custom command to focus Firefox window ($FFTABS_TITLE is passed in env)
+# focus_cmd = ""
+
+# Disable window focus switching
+disable_focus = false
+"""
+
+DEFAULT_CONFIG: dict = {
+    "general": {
+        "default_sort": "window-recent",
+        "previous": False,
+        "search_url": "https://duckduckgo.com/?q={query}",
+        "cache_dir": "",
+        "data_dir": "",
+    },
+    "rofi": {
+        "theme": "",
+        "show_icons": True,
+        "allow_network_icons": True,
+        "show_tab_position": True,
+        "extra_args": [],
+    },
+    "keybindings": {
+        "close_tab": "Alt+d",
+        "close_others": "Alt+o",
+        "close_right": "Alt+r",
+        "close_left": "Alt+l",
+        "new_tab": "Alt+n",
+    },
+    "history": {
+        "enabled": True,
+        "history_file": "",
+        "max_entries": 500,
+        "enable_extension_history": True,
+        "enable_session_cache": True,
+        "exclude_profiles": [],
+        "exclude_url_patterns": [],
+    },
+    "close": {
+        "confirm_scoped_close": True,
+        "cli_confirm": True,
+        "close_pinned": False,
+    },
+    "new_tab": {
+        "enabled": True,
+        "target_profile": "",
+        "default_url": "about:newtab",
+    },
+    "profiles": {
+        "default_profile": "",
+        "ignored_profiles": [],
+    },
+    "compositor": {
+        "focus_cmd": "",
+        "disable_focus": False,
+    },
+}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    merged = base.copy()
+    for k, v in override.items():
+        if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+            merged[k] = _deep_merge(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
 
 def _xdg(var: str, default: str) -> Path:
     return Path(os.environ.get(var) or Path.home() / default)
 
 
+def config_dir() -> Path:
+    return _xdg("XDG_CONFIG_HOME", ".config") / "fftabs"
+
+
+def config_file() -> Path | None:
+    d = config_dir()
+    for fname in ("config.toml", "config.ini"):
+        p = d / fname
+        if p.is_file():
+            return p
+    return None
+
+
+_CONFIG_CACHE: dict | None = None
+
+
+def get_config(reload: bool = False) -> dict:
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is None or reload:
+        _CONFIG_CACHE = load_config()
+    return _CONFIG_CACHE
+
+
+def load_config(path: Path | None = None) -> dict:
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    target = path or config_file()
+    if not target or not target.is_file():
+        return cfg
+
+    try:
+        if target.suffix == ".toml" and tomllib:
+            data = tomllib.loads(target.read_text(encoding="utf-8"))
+            cfg = _deep_merge(cfg, data)
+        else:
+            cp = configparser.ConfigParser()
+            cp.read(str(target), encoding="utf-8")
+            for section in cp.sections():
+                sec_lower = section.lower()
+                if sec_lower in cfg:
+                    for key, val in cp.items(section):
+                        orig_val = cfg[sec_lower].get(key)
+                        if isinstance(orig_val, bool):
+                            cfg[sec_lower][key] = cp.getboolean(section, key)
+                        elif isinstance(orig_val, int):
+                            cfg[sec_lower][key] = cp.getint(section, key)
+                        elif isinstance(orig_val, list):
+                            cfg[sec_lower][key] = [x.strip() for x in val.split(",") if x.strip()]
+                        else:
+                            cfg[sec_lower][key] = val
+    except Exception as e:
+        warn(f"error reading {target}: {e}")
+    return cfg
+
+
+# ----------------------------------------------------------------------------
+# paths / small helpers
+# ----------------------------------------------------------------------------
+
 def cache_dir() -> Path:
+    custom = get_config().get("general", {}).get("cache_dir")
+    if custom:
+        return Path(os.path.expanduser(custom))
     return _xdg("XDG_CACHE_HOME", ".cache") / "fftabs"
 
 
 def data_dir() -> Path:
+    custom = get_config().get("general", {}).get("data_dir")
+    if custom:
+        return Path(os.path.expanduser(custom))
     return _xdg("XDG_DATA_HOME", ".local/share") / "fftabs"
 
 
@@ -408,6 +637,11 @@ def fetch_tabs() -> list[dict]:
         profile_path = profile.get("path")
         prof_key = profile_instance_key(profile)
 
+        # Skip ignored profiles from config
+        ignored_profs = {ip.lower() for ip in get_config().get("profiles", {}).get("ignored_profiles", [])}
+        if profile_name.lower() in ignored_profs or slugify(profile_name).lower() in ignored_profs:
+            continue
+
         # Ignore duplicate host connections for an already queried profile
         if prof_key in seen_profiles:
             continue
@@ -625,6 +859,8 @@ def execute_close_tabs(path: Path, tab_id: int, scope: str, keep_pinned: bool = 
 def confirm_scoped_close(target_tab: dict, to_close: list[dict], scope: str) -> bool:
     if not to_close:
         return False
+    if not get_config().get("close", {}).get("confirm_scoped_close", True):
+        return True
     count = len(to_close)
     scope_labels = {
         "others": "other tabs",
@@ -663,10 +899,25 @@ def confirm_scoped_close(target_tab: dict, to_close: list[dict], scope: str) -> 
 
 
 def history_file() -> Path:
+    custom = get_config().get("history", {}).get("history_file")
+    if custom:
+        return Path(os.path.expanduser(custom))
     return cache_dir() / "history.json"
 
 
 def record_history(tabs: list[dict]) -> None:
+    cfg = get_config().get("history", {})
+    if not cfg.get("enabled", True) or not cfg.get("enable_session_cache", True):
+        return
+
+    exclude_profs = {p.lower() for p in cfg.get("exclude_profiles", [])}
+    exclude_patterns = []
+    for pat in cfg.get("exclude_url_patterns", []):
+        try:
+            exclude_patterns.append(re.compile(pat))
+        except Exception:
+            pass
+
     p = history_file()
     entries: dict[str, dict] = {}
     if p.exists():
@@ -679,9 +930,18 @@ def record_history(tabs: list[dict]) -> None:
 
     now = int(time.time() * 1000)
     for t in tabs:
+        prof_name = (t.get("_profile_name") or "").lower()
+        prof_slug = (t.get("_profile_slug") or "").lower()
+        if prof_name in exclude_profs or prof_slug in exclude_profs:
+            continue
+
         url = t.get("url")
         if not url or url.startswith("about:"):
             continue
+
+        if any(pat.search(url) for pat in exclude_patterns):
+            continue
+
         title = t.get("title") or url
         fav = t.get("favIconUrl") or ""
         entries[url] = {
@@ -691,7 +951,8 @@ def record_history(tabs: list[dict]) -> None:
             "lastAccessed": t.get("lastAccessed") or now,
         }
 
-    sorted_items = sorted(entries.values(), key=lambda x: -(x.get("lastAccessed") or 0))[:500]
+    max_entries = cfg.get("max_entries", 500)
+    sorted_items = sorted(entries.values(), key=lambda x: -(x.get("lastAccessed") or 0))[:max_entries]
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(sorted_items, indent=2))
@@ -700,45 +961,66 @@ def record_history(tabs: list[dict]) -> None:
 
 
 def fetch_combined_history(query: str = "") -> list[dict]:
+    cfg = get_config().get("history", {})
+    if not cfg.get("enabled", True):
+        return []
+
+    exclude_profs = {p.lower() for p in cfg.get("exclude_profiles", [])}
+    exclude_patterns = []
+    for pat in cfg.get("exclude_url_patterns", []):
+        try:
+            exclude_patterns.append(re.compile(pat))
+        except Exception:
+            pass
+
     merged: dict[str, dict] = {}
 
     # Source 1: Local cache
-    p = history_file()
-    if p.exists():
-        try:
-            for item in json.loads(p.read_text()):
-                u = item.get("url")
-                if u:
-                    merged[u] = {
-                        "url": u,
-                        "title": item.get("title") or u,
-                        "favIconUrl": item.get("favIconUrl", ""),
-                        "lastAccessed": item.get("lastAccessed", 0),
-                    }
-        except Exception:
-            pass
-
-    # Source 2: Firefox extension history API
-    socks = sockets()
-    for s in socks:
-        try:
-            r = rpc(s, {"cmd": "history", "query": query, "limit": 100})
-            if r.get("ok"):
-                for item in r.get("result", []):
+    if cfg.get("enable_session_cache", True):
+        p = history_file()
+        if p.exists():
+            try:
+                for item in json.loads(p.read_text()):
                     u = item.get("url")
-                    if not u or u.startswith("about:"):
-                        continue
-                    existing = merged.get(u)
-                    acc = item.get("lastVisitTime") or 0
-                    if not existing or acc > (existing.get("lastAccessed") or 0):
+                    if u and not any(pat.search(u) for pat in exclude_patterns):
                         merged[u] = {
                             "url": u,
                             "title": item.get("title") or u,
-                            "favIconUrl": existing.get("favIconUrl", "") if existing else "",
-                            "lastAccessed": acc,
+                            "favIconUrl": item.get("favIconUrl", ""),
+                            "lastAccessed": item.get("lastAccessed", 0),
                         }
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+    # Source 2: Firefox extension history API
+    if cfg.get("enable_extension_history", True):
+        socks = sockets()
+        for s in socks:
+            try:
+                r_ping = rpc(s, {"cmd": "ping"})
+                prof_info = (r_ping if isinstance(r_ping, dict) else {}).get("profile") or {}
+                p_name = (prof_info.get("name") or "").lower()
+                p_slug = slugify(p_name).lower()
+                if p_name in exclude_profs or p_slug in exclude_profs:
+                    continue
+
+                r = rpc(s, {"cmd": "history", "query": query, "limit": 100})
+                if r.get("ok"):
+                    for item in r.get("result", []):
+                        u = item.get("url")
+                        if not u or u.startswith("about:") or any(pat.search(u) for pat in exclude_patterns):
+                            continue
+                        existing = merged.get(u)
+                        acc = item.get("lastVisitTime") or 0
+                        if not existing or acc > (existing.get("lastAccessed") or 0):
+                            merged[u] = {
+                                "url": u,
+                                "title": item.get("title") or u,
+                                "favIconUrl": existing.get("favIconUrl", "") if existing else "",
+                                "lastAccessed": acc,
+                            }
+            except Exception:
+                pass
 
     q = query.lower().strip()
     results = list(merged.values())
@@ -752,19 +1034,21 @@ def fetch_combined_history(query: str = "") -> list[dict]:
 def resolve_url_or_search(text: str) -> str:
     text = text.strip()
     if not text:
-        return "about:newtab"
+        return get_config().get("new_tab", {}).get("default_url", "about:newtab")
     if text.startswith(("http://", "https://", "about:", "file://")):
         return text
     if re.match(r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?::\d+)?(?:/.*)?$", text) or re.match(r"^localhost(?::\d+)?(?:/.*)?$", text):
         return f"https://{text}"
-    search_tmpl = os.environ.get("FFTABS_SEARCH_URL", "https://duckduckgo.com/?q={query}")
-    return search_tmpl.format(query=urllib.parse.quote_plus(text))
+    tmpl = get_config().get("general", {}).get("search_url") or os.environ.get("FFTABS_SEARCH_URL", "https://duckduckgo.com/?q={query}")
+    return tmpl.format(query=urllib.parse.quote_plus(text))
 
 
 def get_target_window(profile: str | None = None) -> tuple[Path, dict]:
     socks = sockets()
     if not socks:
         die("no Firefox connected (is the extension loaded? try `fftabs status`)")
+
+    target_profile = profile or get_config().get("new_tab", {}).get("target_profile") or None
 
     candidates: list[tuple[Path, dict, int, int]] = []
     for p in socks:
@@ -777,7 +1061,7 @@ def get_target_window(profile: str | None = None) -> tuple[Path, dict]:
         prof_info = r.get("profile") or {}
         p_name = prof_info.get("name") or sock_pid(p)
         p_slug = slugify(p_name)
-        if profile and profile.lower() not in (p_slug.lower(), p_name.lower()):
+        if target_profile and target_profile.lower() not in (p_slug.lower(), p_name.lower()):
             continue
 
         tabs = r.get("result") or []
@@ -796,8 +1080,8 @@ def get_target_window(profile: str | None = None) -> tuple[Path, dict]:
             candidates.append((p, w_obj, is_foc, max_acc))
 
     if not candidates:
-        if profile:
-            die(f"no profile matching {profile!r} found")
+        if target_profile:
+            die(f"no profile matching {target_profile!r} found")
         return socks[0], {"id": None}
 
     candidates.sort(key=lambda c: (-c[2], -c[3]))
@@ -805,6 +1089,9 @@ def get_target_window(profile: str | None = None) -> tuple[Path, dict]:
 
 
 def open_tab(url: str, sock_path: Path | None = None, window_id: int | None = None) -> None:
+    if not get_config().get("new_tab", {}).get("enabled", True):
+        die("new tab creation is disabled in configuration")
+
     if sock_path is None or window_id is None:
         target_sock, target_win = get_target_window()
         sock_path = sock_path or target_sock
@@ -1094,17 +1381,10 @@ def _detect_backend() -> str | None:
 
 
 def focus_firefox_window(title: str, firefox_pid: int | None = None) -> None:
-    """Firefox cannot reliably raise itself on Wayland, so ask the compositor.
-
-    One Firefox window -> focus it. Several -> focus the one whose title contains the
-    tab title (Firefox titles windows after their active tab). When firefox_pid is provided,
-    first filter compositor windows by PID to target the correct profile.
-    FFTABS_FOCUS_CMD overrides everything (run through the shell, tab title in $FFTABS_TITLE);
-    FFTABS_NO_FOCUS=1 skips.
-    """
-    if os.environ.get("FFTABS_NO_FOCUS"):
+    comp_cfg = get_config().get("compositor", {})
+    if comp_cfg.get("disable_focus", False) or os.environ.get("FFTABS_NO_FOCUS"):
         return
-    custom = os.environ.get("FFTABS_FOCUS_CMD")
+    custom = comp_cfg.get("focus_cmd") or os.environ.get("FFTABS_FOCUS_CMD")
     if custom:
         subprocess.run(custom, shell=True, env={**os.environ, "FFTABS_TITLE": title})
         return
@@ -1176,15 +1456,18 @@ def build_payload(tabs: list[dict], no_icons: bool) -> bytes:
         total_in_win = win_tab_counts.get(wkey, 1)
         pos_tag = f"#{t.get('index', 0) + 1}/{total_in_win}"
 
+        show_pos = get_config().get("rofi", {}).get("show_tab_position", True)
+        pos_suffix = f" [{pos_tag}]" if show_pos else ""
+
         if multi_profile:
             prof_name = t.get("_profile_name", t["_pid"])
             if multi_win:
-                tags.append(f"{prof_name}/win {t['window']['n']} [{pos_tag}]")
+                tags.append(f"{prof_name}/win {t['window']['n']}{pos_suffix}")
             else:
-                tags.append(f"{prof_name} [{pos_tag}]")
+                tags.append(f"{prof_name}{pos_suffix}")
         elif multi_win:
-            tags.append(f"win {t['window']['n']} [{pos_tag}]")
-        else:
+            tags.append(f"win {t['window']['n']}{pos_suffix}")
+        elif show_pos:
             tags.append(f"[{pos_tag}]")
         row = "{}  <span alpha='55%' size='small'>{}</span>".format(
             html.escape(title, quote=False), html.escape(" \u00b7 ".join(tags), quote=False)
@@ -1201,38 +1484,64 @@ def build_payload(tabs: list[dict], no_icons: bool) -> bytes:
 def cmd_rofi(args, extra) -> int:
     if not shutil.which("rofi"):
         die("rofi not found in PATH")
-    allow_net = not (args.no_fetch or os.environ.get("FFTABS_NO_FETCH"))
-    sel = 1 if args.previous else 0
+
+    cfg = get_config()
+    gen_cfg = cfg.get("general", {})
+    rofi_cfg = cfg.get("rofi", {})
+    kb_cfg = cfg.get("keybindings", {})
+
+    sort_mode = args.sort if getattr(args, "_sort_explicit", False) else gen_cfg.get("default_sort", args.sort)
+    allow_net = not (args.no_fetch or os.environ.get("FFTABS_NO_FETCH") or not rofi_cfg.get("allow_network_icons", True))
+    no_icons = args.no_icons or not rofi_cfg.get("show_icons", True)
+
+    user_extra = list(rofi_cfg.get("extra_args", []))
+    if rofi_cfg.get("theme"):
+        user_extra += ["-theme", os.path.expanduser(rofi_cfg["theme"])]
+    user_extra += extra
+
+    sel = 1 if (args.previous or gen_cfg.get("previous", False)) else 0
+    prof_filter = getattr(args, "profile", None) or cfg.get("profiles", {}).get("default_profile", "")
+
+    # Dynamic keybindings
+    kb_actions = [
+        (kb_cfg.get("close_tab", "Alt+d"), "-kb-custom-1", "<b>{key}</b> close"),
+        (kb_cfg.get("close_others", "Alt+o"), "-kb-custom-2", "<b>{key}</b> others"),
+        (kb_cfg.get("close_right", "Alt+r"), "-kb-custom-3", "<b>{key}</b> right"),
+        (kb_cfg.get("close_left", "Alt+l"), "-kb-custom-4", "<b>{key}</b> left"),
+        (kb_cfg.get("new_tab", "Alt+n"), "-kb-custom-5", "<b>{key}</b> new tab"),
+    ]
+    kb_flags = []
+    msg_parts = ["<b>Enter</b> switch"]
+    for key, flag, msg_tmpl in kb_actions:
+        if key:
+            kb_flags += [flag, key]
+            msg_parts.append(msg_tmpl.format(key=key))
+
     while True:
-        tabs = ordered(fetch_tabs(), args.sort)
-        if getattr(args, "profile", None):
-            slug = slugify(args.profile)
+        tabs = ordered(fetch_tabs(), sort_mode)
+        if prof_filter:
+            slug = slugify(prof_filter)
             tabs = [t for t in tabs if t["_profile_slug"] == slug
-                    or t["_profile_name"].lower() == args.profile.lower()]
+                    or t["_profile_name"].lower() == prof_filter.lower()]
             if not tabs:
-                die(f"no profile matching {args.profile!r}")
+                die(f"no profile matching {prof_filter!r}")
             for t in tabs:
                 t["ref"] = str(t["id"])
         if not tabs:
             die("no tabs open")
-        if not args.no_icons:
+        if not no_icons:
             prefetch_icons({t.get("favIconUrl", "") for t in tabs}, allow_net)
         cmd = [
             "rofi", "-dmenu", "-i", "-p", "tabs", "-markup-rows", "-no-custom",
             "-format", "i",
-            "-kb-custom-1", "Alt+d",
-            "-kb-custom-2", "Alt+o",
-            "-kb-custom-3", "Alt+r",
-            "-kb-custom-4", "Alt+l",
-            "-kb-custom-5", "Alt+n",
-            "-mesg", "<b>Enter</b> switch · <b>Alt+d</b> close · <b>Alt+o</b> others · <b>Alt+r</b> right · <b>Alt+l</b> left · <b>Alt+n</b> new tab",
-        ]
-        if not args.no_icons:
+        ] + kb_flags + ["-mesg", " · ".join(msg_parts)]
+
+        if not no_icons:
             cmd.append("-show-icons")
         if sel:
             cmd += ["-selected-row", str(min(sel, len(tabs) - 1))]
         res = subprocess.run(
-            cmd + extra, input=build_payload(tabs, args.no_icons), stdout=subprocess.PIPE
+            cmd + user_extra, input=build_payload(tabs, no_icons), stdout=subprocess.PIPE
         )
         try:
             idx = int(res.stdout.decode().strip())
@@ -1274,13 +1583,15 @@ def cmd_rofi(args, extra) -> int:
 
 
 def cmd_list(args, _extra) -> int:
-    tabs = ordered(fetch_tabs(), args.sort)
-    if getattr(args, "profile", None):
-        slug = slugify(args.profile)
+    sort_mode = args.sort if getattr(args, "_sort_explicit", False) else get_config().get("general", {}).get("default_sort", args.sort)
+    tabs = ordered(fetch_tabs(), sort_mode)
+    prof_filter = getattr(args, "profile", None) or get_config().get("profiles", {}).get("default_profile", "")
+    if prof_filter:
+        slug = slugify(prof_filter)
         tabs = [t for t in tabs if t["_profile_slug"] == slug
-                or t["_profile_name"].lower() == args.profile.lower()]
+                or t["_profile_name"].lower() == prof_filter.lower()]
         if not tabs:
-            die(f"no profile matching {args.profile!r}")
+            die(f"no profile matching {prof_filter!r}")
         for t in tabs:
             t["ref"] = str(t["id"])
     if args.json:
@@ -1389,6 +1700,30 @@ def cmd_open(args, extra) -> int:
     return cmd_open_picker(args, extra)
 
 
+def cmd_config(args, _extra) -> int:
+    cfg_path = config_file()
+    if getattr(args, "path", False):
+        if cfg_path:
+            print(cfg_path)
+            return 0
+        print(config_dir() / "config.toml")
+        return 0
+
+    if getattr(args, "init", False):
+        target = config_dir() / "config.toml"
+        if target.exists() and not getattr(args, "force", False):
+            die(f"{target} already exists (use --force to overwrite)")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(CONFIG_TEMPLATE.lstrip(), encoding="utf-8")
+        print(f"wrote {target}")
+        return 0
+
+    cfg = get_config(reload=True)
+    json.dump(cfg, sys.stdout, indent=2)
+    print()
+    return 0
+
+
 def _wrapper_path() -> Path:
     return data_dir() / "fftabs-host"
 
@@ -1476,10 +1811,8 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("rofi", help="pick a tab with rofi (default); args after -- go to rofi")
-    p.add_argument("--sort", choices=SORT_CHOICES, default="window-recent",
-                   help="sort order: window-recent (default: MRU window first + tab MRU inside), "
-                        "recent (pure tab MRU), window-index (MRU window + tab index), "
-                        "window-num (static window order)")
+    p.add_argument("--sort", choices=SORT_CHOICES, default=None,
+                   help="sort order: window-recent, recent, window-index, window-num (defaults to config)")
     p.add_argument("--previous", action="store_true", help="preselect the previous tab (alt-tab style)")
     p.add_argument("--no-icons", action="store_true")
     p.add_argument("--no-fetch", action="store_true", help="never download favicons (cached/data: only)")
@@ -1488,8 +1821,8 @@ def main() -> int:
 
     p = sub.add_parser("list", help="print tabs (TSV: ref, profile, window, current, title, url)")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--sort", choices=SORT_CHOICES, default="window-recent",
-                   help="sort order: window-recent (default), recent, window-index, window-num")
+    p.add_argument("--sort", choices=SORT_CHOICES, default=None,
+                   help="sort order: window-recent, recent, window-index, window-num (defaults to config)")
     p.add_argument("--profile", metavar="NAME", help="show only tabs from this profile")
     p.set_defaults(fn=cmd_list)
 
@@ -1524,6 +1857,13 @@ def main() -> int:
         p.add_argument("--no-icons", action="store_true")
         p.add_argument("--no-fetch", action="store_true")
         p.set_defaults(fn=cmd_open)
+
+    p = sub.add_parser("config", help="view or generate fftabs configuration")
+    p.add_argument("--init", action="store_true", help="generate ~/.config/fftabs/config.toml")
+    p.add_argument("--path", action="store_true", help="print path to active config file")
+    p.add_argument("--show", action="store_true", help="dump resolved configuration as JSON")
+    p.add_argument("--force", action="store_true", help="overwrite existing config on --init")
+    p.set_defaults(fn=cmd_config)
 
     for name, fn, text in (
         ("status", cmd_status, "check the whole chain"),
