@@ -303,6 +303,43 @@ class TestMultiProfileIntegration(unittest.TestCase):
             ff1.stop()
             ff2.stop()
 
+    def test_duplicate_host_connections_for_same_profile(self):
+        # Two hosts connected to the exact SAME profile instance (same profile dirname)
+        ff1 = FakeFirefoxController("Work", "dir.WorkSame", "groups_db", runtime_dir=self.runtime_dir)
+        info1 = ff1.start()
+        ff2 = FakeFirefoxController("Work", "dir.WorkSame", "groups_db", runtime_dir=self.runtime_dir)
+        info2 = ff2.start()
+
+        try:
+            tabs = fftabs.fetch_tabs()
+            # Must return only 1 set of tabs, NOT 2 (no duplication!)
+            self.assertEqual(len(tabs), 1)
+            # Since only 1 distinct profile is active, refs should be bare IDs
+            self.assertEqual(tabs[0]["ref"], "1")
+
+            # Bare ID resolves cleanly without ambiguity error
+            sp, tid = fftabs.resolve_ref("1")
+            self.assertIn(str(sp), (info1["sock_path"], info2["sock_path"]))
+            self.assertEqual(tid, 1)
+
+            # Profile:ID resolution also works without ambiguous profile error
+            sp2, tid2 = fftabs.resolve_ref("work:1")
+            self.assertIn(str(sp2), (info1["sock_path"], info2["sock_path"]))
+            self.assertEqual(tid2, 1)
+
+            # Check status output marks duplicate
+            class StatusArgs:
+                manifest_dir = None
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                fftabs.cmd_status(StatusArgs(), [])
+            status_txt = buf.getvalue()
+            self.assertIn("(duplicate connection)", status_txt)
+        finally:
+            ff1.stop()
+            ff2.stop()
+
+
     def test_rofi_with_stub(self):
         # Test rofi execution with stub script
         stub_dir = tempfile.mkdtemp(prefix="rofi_test_stub_")

@@ -229,6 +229,19 @@ def detect_profile(ppid: int | None = None) -> dict:
     return info
 
 
+def profile_instance_key(prof: dict) -> str:
+    """Stable unique key for a running Firefox profile instance."""
+    path = prof.get("path")
+    fpid = prof.get("firefox_pid")
+    name = prof.get("name") or "unknown"
+    if path:
+        return f"path:{path}"
+    if fpid:
+        return f"pid:{fpid}:{name}"
+    return f"name:{name}"
+
+
+
 # ----------------------------------------------------------------------------
 # native messaging host (started by Firefox; NEVER print to stdout in here)
 # ----------------------------------------------------------------------------
@@ -374,6 +387,9 @@ def rpc(path: Path, req: dict, timeout: float = 10.0) -> dict:
 def fetch_tabs() -> list[dict]:
     tabs: list[dict] = []
     live: list[tuple[Path, dict]] = []
+    seen_profiles: set[str] = set()
+    seen_tabs: set[tuple[str, int]] = set()
+
     for p in sockets():
         try:
             r = rpc(p, {"cmd": "list"})
@@ -390,8 +406,19 @@ def fetch_tabs() -> list[dict]:
         profile_name = profile.get("name") or sock_pid(p)
         firefox_pid = profile.get("firefox_pid")
         profile_path = profile.get("path")
-        live.append((p, {"name": profile_name, "path": profile_path, "firefox_pid": firefox_pid}))
+        prof_key = profile_instance_key(profile)
+
+        # Ignore duplicate host connections for an already queried profile
+        if prof_key in seen_profiles:
+            continue
+        seen_profiles.add(prof_key)
+
+        live.append((p, {"name": profile_name, "path": profile_path, "firefox_pid": firefox_pid, "key": prof_key}))
         for t in r["result"]:
+            tab_key = (prof_key, t["id"])
+            if tab_key in seen_tabs:
+                continue
+            seen_tabs.add(tab_key)
             t["_sock"] = str(p)
             t["_pid"] = sock_pid(p)
             t["_profile_name"] = profile_name
@@ -459,6 +486,7 @@ def resolve_ref(ref: str) -> tuple[Path, int]:
 
     # Match prefix against connected hosts' profile names / slugs
     matched_socks = []
+    seen_matched_keys = set()
     for p in socks:
         try:
             r = rpc(p, {"cmd": "ping"})
@@ -466,15 +494,18 @@ def resolve_ref(ref: str) -> tuple[Path, int]:
             continue
         profile = (r if isinstance(r, dict) else {}).get("profile") or {}
         name = profile.get("name") or sock_pid(p)
+        prof_key = profile_instance_key(profile)
         slug = slugify(name)
         pid = sock_pid(p)
         if prefix.lower() in (slug.lower(), f"{slug}-{pid}".lower(), name.lower()):
-            matched_socks.append(p)
+            if prof_key not in seen_matched_keys:
+                seen_matched_keys.add(prof_key)
+                matched_socks.append(p)
 
     if len(matched_socks) == 1:
         return matched_socks[0], tid
     if len(matched_socks) > 1:
-        die(f"ambiguous profile {prefix!r}: matches {len(matched_socks)} hosts; use PID:ID instead")
+        die(f"ambiguous profile {prefix!r}: matches {len(matched_socks)} distinct profiles; use PID:ID instead")
     die(f"no Firefox profile matching {prefix!r} (try `fftabs list`)")
 
 
@@ -940,13 +971,19 @@ def cmd_status(args, _extra) -> int:
     if not socks:
         print("firefox         : NOT CONNECTED (extension not loaded, or Firefox not running)")
         return 1
+    seen_keys: set[str] = set()
     for p in socks:
         try:
             r = rpc(p, {"cmd": "ping"}, timeout=5)
             state = "ok" if r.get("ok") else f"error: {r.get('error')}"
-            profile = (r.get("profile") or {}).get("name")
+            prof = (r if isinstance(r, dict) else {}).get("profile") or {}
+            profile = prof.get("name")
+            prof_key = profile_instance_key(prof)
+            is_dup = prof_key in seen_keys
+            seen_keys.add(prof_key)
             if profile and r.get("ok"):
-                state = f"ok  profile={profile}"
+                dup_note = " (duplicate connection)" if is_dup else ""
+                state = f"ok  profile={profile}{dup_note}"
         except ConnectionRefusedError:
             p.unlink(missing_ok=True)
             continue
