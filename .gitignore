@@ -1,0 +1,30 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Local runtime & cache files
+.cache/
+*.log
+*.sock
+
+# Packaging & distribution artifacts
+web-ext-artifacts/
+*.zip
+*.xpi
+.amo-upload-uuid
+build/
+dist/
+*.egg-info/
+
+# Editor & OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# Internal scratch/plans
+plan.md

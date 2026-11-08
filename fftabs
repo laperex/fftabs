@@ -1,0 +1,1015 @@
+#!/usr/bin/env python3
+"""fftabs - list and switch Firefox tabs from the shell, with a rofi front-end.
+
+    Firefox  <-- native messaging -->  fftabs host  <-- unix socket -->  fftabs CLI / rofi
+    (extension/ answers tab queries)   (started by Firefox)              (this script)
+
+Usage:  fftabs [rofi|list|switch|close|status|install|uninstall]   (default: rofi)
+        fftabs rofi -- <extra rofi args>
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import configparser
+import hashlib
+import html
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HOST_NAME = "fftabs"
+ALLOWED_EXTENSIONS = ["fftabs@krishnadev7777", "fftabs@localhost"]
+DEFAULT_MANIFEST_DIR = "~/.mozilla/native-messaging-hosts"
+FALLBACK_ICON = "firefox"  # icon-theme name used when a tab has no usable favicon
+
+
+# ----------------------------------------------------------------------------
+# paths / small helpers
+# ----------------------------------------------------------------------------
+
+def _xdg(var: str, default: str) -> Path:
+    return Path(os.environ.get(var) or Path.home() / default)
+
+
+def cache_dir() -> Path:
+    return _xdg("XDG_CACHE_HOME", ".cache") / "fftabs"
+
+
+def data_dir() -> Path:
+    return _xdg("XDG_DATA_HOME", ".local/share") / "fftabs"
+
+
+def runtime_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base and os.path.isdir(base):
+        return Path(base)
+    d = Path(f"/tmp/fftabs-{os.getuid()}")
+    d.mkdir(mode=0o700, exist_ok=True)
+    if d.stat().st_uid != os.getuid():
+        raise SystemExit(f"fftabs: {d} belongs to another user")
+    return d
+
+
+def die(msg: str, code: int = 1):
+    print(f"fftabs: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def warn(msg: str) -> None:
+    print(f"fftabs: {msg}", file=sys.stderr)
+
+
+def sanitize(s: str | None) -> str:
+    """Single-line text with no control characters (rofi rows are NL/NUL/US delimited)."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", s or "").strip()
+
+
+def truncate(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "\u2026"
+
+
+def log(msg: str) -> None:
+    try:
+        d = cache_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "host.log"
+        if p.exists() and p.stat().st_size > 100_000:
+            p.write_text("")
+        with p.open("a") as f:
+            f.write(f"{time.strftime('%F %T')} [{os.getpid()}] {msg}\n")
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# profile detection (host side, no extension round-trip)
+# ----------------------------------------------------------------------------
+
+def slugify(name: str) -> str:
+    """Profile name -> lowercase slug for use in refs."""
+    s = re.sub(r"[^a-z0-9_-]+", "-", name.lower())
+    return s.strip("-") or "unknown"
+
+
+def _find_parentlock(ppid: int) -> Path | None:
+    """Scan /proc/<ppid>/fd for a symlink to */.parentlock or places.sqlite."""
+    fd_dir = Path(f"/proc/{ppid}/fd")
+    try:
+        for entry in fd_dir.iterdir():
+            try:
+                target = entry.resolve(strict=False)
+                if target.name in (".parentlock", "places.sqlite"):
+                    return target.parent
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return None
+
+
+def _query_profile_groups_db(firefox_dir: Path, profile_dirname: str) -> str | None:
+    """Look up profile name in Firefox's Profile Groups sqlite DB."""
+    pg_dir = firefox_dir / "Profile Groups"
+    if not pg_dir.is_dir():
+        return None
+    for db_path in pg_dir.glob("*.sqlite"):
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+            try:
+                row = con.execute(
+                    "SELECT name FROM Profiles WHERE path = ?", (profile_dirname,)
+                ).fetchone()
+                if row and row[0]:
+                    return row[0]
+            finally:
+                con.close()
+        except Exception:
+            continue
+    return None
+
+
+def _parse_profiles_ini(firefox_dir: Path, profile_dirname: str) -> str | None:
+    """Look up profile name in profiles.ini by matching Path."""
+    ini_path = firefox_dir / "profiles.ini"
+    if not ini_path.is_file():
+        return None
+    cp = configparser.RawConfigParser()
+    try:
+        cp.read(str(ini_path), encoding="utf-8")
+    except Exception:
+        return None
+    for sec in cp.sections():
+        if not sec.lower().startswith("profile"):
+            continue
+        path = cp.get(sec, "Path", fallback=None)
+        if not path:
+            continue
+        if cp.get(sec, "IsRelative", fallback="1") == "1":
+            target_match = (path == profile_dirname)
+        else:
+            resolved = str(Path(path).resolve())
+            prof_resolved = str((firefox_dir / profile_dirname).resolve())
+            target_match = (resolved == prof_resolved)
+        if target_match:
+            return cp.get(sec, "Name", fallback=None)
+    return None
+
+
+def _profile_from_cmdline(ppid: int) -> str | None:
+    """Parse /proc/<ppid>/cmdline for -P name, --profile path, -profile path."""
+    try:
+        raw = Path(f"/proc/{ppid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    args = raw.rstrip(b"\x00").split(b"\x00")
+    args = [a.decode("utf-8", "replace") for a in args]
+    for i, a in enumerate(args):
+        if a in ("--profile", "-profile") and i + 1 < len(args):
+            return Path(args[i + 1]).name
+        if a == "-P" and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def detect_profile(ppid: int | None = None) -> dict:
+    """Detect which Firefox profile this host belongs to. Returns
+    {"name": str, "path": str|None, "firefox_pid": int}."""
+    if ppid is None:
+        try:
+            ppid = int(os.environ.get("FFTABS_FIREFOX_PID") or os.getppid())
+        except (ValueError, TypeError):
+            ppid = os.getppid()
+    info: dict = {"name": str(ppid), "path": None, "firefox_pid": ppid}
+
+    # Step 1: find profile dir via /proc/ppid/fd -> .parentlock or places.sqlite
+    profile_dir = _find_parentlock(ppid)
+    if profile_dir:
+        info["path"] = profile_dir.name
+        firefox_dir = profile_dir.parent
+
+        # Step 2a: Profile Groups DB (Firefox >= 140)
+        name = _query_profile_groups_db(firefox_dir, profile_dir.name)
+        if name:
+            info["name"] = name
+            return info
+
+        # Step 2b: profiles.ini
+        name = _parse_profiles_ini(firefox_dir, profile_dir.name)
+        if name:
+            info["name"] = name
+            return info
+
+    # Step 3: cmdline
+    name = _profile_from_cmdline(ppid)
+    if name:
+        info["name"] = name
+        return info
+
+    # Step 4: directory basename (if we found it)
+    if profile_dir:
+        info["name"] = profile_dir.name
+        return info
+
+    # Step 5: PID as name (last resort)
+    return info
+
+
+# ----------------------------------------------------------------------------
+# native messaging host (started by Firefox; NEVER print to stdout in here)
+# ----------------------------------------------------------------------------
+
+class Host:
+    def __init__(self) -> None:
+        self.sock_path = runtime_dir() / f"fftabs-{os.getpid()}.sock"
+        self.out_lock = threading.Lock()
+        self.pending_lock = threading.Lock()
+        self.pending: dict[int, dict] = {}
+        self.next_id = 1
+        self.profile = detect_profile()
+        log(f"host profile: {self.profile}")
+
+    # -- browser side --------------------------------------------------------
+    def send_native(self, obj: dict) -> None:
+        data = json.dumps(obj, separators=(",", ":")).encode()
+        with self.out_lock:
+            sys.stdout.buffer.write(struct.pack("=I", len(data)) + data)
+            sys.stdout.buffer.flush()
+
+    def read_native(self) -> None:
+        stdin = sys.stdin.buffer
+        while True:
+            hdr = stdin.read(4)
+            if len(hdr) < 4:
+                break
+            (n,) = struct.unpack("=I", hdr)
+            body = stdin.read(n)
+            if len(body) < n:
+                break
+            try:
+                msg = json.loads(body)
+            except ValueError:
+                continue
+            with self.pending_lock:
+                slot = self.pending.get(msg.get("id"))
+            if slot:
+                slot["reply"] = msg
+                slot["event"].set()
+        self.shutdown()  # Firefox closed the pipe
+
+    def call_extension(self, req: dict, timeout: float = 8.0) -> dict:
+        slot = {"event": threading.Event(), "reply": None}
+        with self.pending_lock:
+            rid = self.next_id
+            self.next_id += 1
+            self.pending[rid] = slot
+        try:
+            self.send_native({**req, "id": rid})
+            if not slot["event"].wait(timeout):
+                return {"ok": False, "error": "timed out waiting for Firefox"}
+            return slot["reply"]
+        finally:
+            with self.pending_lock:
+                self.pending.pop(rid, None)
+
+    # -- CLI side ------------------------------------------------------------
+    def handle_client(self, conn: socket.socket) -> None:
+        with conn:
+            conn.settimeout(10)
+            buf = b""
+            try:
+                while b"\n" not in buf and len(buf) < 65536:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                req = json.loads(buf.split(b"\n", 1)[0] or b"null")
+                if not isinstance(req, dict):
+                    raise ValueError("request must be an object")
+            except (ValueError, OSError):
+                reply = {"ok": False, "error": "bad request"}
+            else:
+                reply = self.call_extension(req)
+            if isinstance(reply, dict):
+                reply["profile"] = self.profile
+            try:
+                conn.sendall(json.dumps(reply).encode() + b"\n")
+            except OSError:
+                pass
+
+    def shutdown(self) -> None:
+        try:
+            self.sock_path.unlink()
+        except OSError:
+            pass
+        log("host exiting")
+        os._exit(0)
+
+    def run(self) -> None:
+        os.umask(0o077)
+        try:
+            self.sock_path.unlink()
+        except FileNotFoundError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(self.sock_path))
+        srv.listen(8)
+        log(f"host started, socket {self.sock_path}")
+        signal.signal(signal.SIGTERM, lambda *_: self.shutdown())
+        threading.Thread(target=self.read_native, daemon=True).start()
+        while True:
+            conn, _ = srv.accept()
+            threading.Thread(target=self.handle_client, args=(conn,), daemon=True).start()
+
+
+def cmd_host(_args, _extra) -> int:
+    Host().run()
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# talking to the host(s)
+# ----------------------------------------------------------------------------
+
+def sockets() -> list[Path]:
+    return sorted(runtime_dir().glob("fftabs-*.sock"))
+
+
+def sock_pid(p: Path) -> str:
+    m = re.fullmatch(r"fftabs-(\d+)\.sock", p.name)
+    return m.group(1) if m else "?"
+
+
+def rpc(path: Path, req: dict, timeout: float = 10.0) -> dict:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(str(path))
+        s.sendall(json.dumps(req).encode() + b"\n")
+        buf = bytearray()
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf)
+    finally:
+        s.close()
+
+
+def fetch_tabs() -> list[dict]:
+    tabs: list[dict] = []
+    live: list[tuple[Path, dict]] = []
+    for p in sockets():
+        try:
+            r = rpc(p, {"cmd": "list"})
+        except ConnectionRefusedError:
+            p.unlink(missing_ok=True)  # stale socket from a crashed host
+            continue
+        except (OSError, ValueError) as e:
+            warn(f"{p.name}: {e}")
+            continue
+        if not r.get("ok"):
+            warn(f"{p.name}: {r.get('error', 'unknown error')}")
+            continue
+        profile = r.get("profile") or {}
+        profile_name = profile.get("name") or sock_pid(p)
+        firefox_pid = profile.get("firefox_pid")
+        profile_path = profile.get("path")
+        live.append((p, {"name": profile_name, "path": profile_path, "firefox_pid": firefox_pid}))
+        for t in r["result"]:
+            t["_sock"] = str(p)
+            t["_pid"] = sock_pid(p)
+            t["_profile_name"] = profile_name
+            t["_profile_path"] = profile_path
+            t["_firefox_pid"] = firefox_pid
+            tabs.append(t)
+    if not live:
+        die("no Firefox connected (is the extension loaded? try `fftabs status`)")
+
+    # Detect slug collision across distinct profiles
+    slug_counts: dict[str, list[str]] = {}
+    for p, prof in live:
+        s = slugify(prof["name"])
+        slug_counts.setdefault(s, []).append(sock_pid(p))
+
+    multi_profile = len(live) > 1
+
+    for t in tabs:
+        s = slugify(t["_profile_name"])
+        if len(slug_counts.get(s, [])) > 1:
+            s = f"{s}-{t['_pid']}"
+        t["_profile_slug"] = s
+        t["current"] = bool(t["active"] and t["window"]["focused"])
+        t["ref"] = f"{s}:{t['id']}" if multi_profile else str(t["id"])
+    return tabs
+
+
+def ordered(tabs: list[dict], mode: str) -> list[dict]:
+    if mode == "window":
+        return sorted(tabs, key=lambda t: (t.get("_profile_slug", ""), t["window"]["n"], t["index"]))
+    return sorted(tabs, key=lambda t: -(t.get("lastAccessed") or 0))
+
+
+def resolve_ref(ref: str) -> tuple[Path, int]:
+    m = re.fullmatch(r"(?:([a-zA-Z0-9_.-]+):)?(\d+)", ref)
+    if not m:
+        die(f"bad tab reference {ref!r} (expected ID, profile:ID, or PID:ID — see `fftabs list`)")
+    prefix, tid_str = m.group(1), m.group(2)
+    tid = int(tid_str)
+    socks = sockets()
+    if not socks:
+        die("no Firefox connected (try `fftabs status`)")
+
+    # Bare ID: unambiguous if only one host is connected
+    if prefix is None:
+        if len(socks) == 1:
+            return socks[0], tid
+        # Check tabs across all connected hosts to see if tid is unique
+        try:
+            tabs = fetch_tabs()
+        except SystemExit:
+            die("no Firefox connected (try `fftabs status`)")
+        matching = [t for t in tabs if t["id"] == tid]
+        if len(matching) == 1:
+            return Path(matching[0]["_sock"]), tid
+        if len(matching) > 1:
+            matching_profs = sorted({t["_profile_name"] for t in matching})
+            die(f"tab ID {tid} is ambiguous (found in profiles: {', '.join(matching_profs)}); use profile:ID")
+        die(f"no tab with ID {tid} found across connected profiles")
+
+    # Check if prefix matches a host PID socket directly (e.g. 12345:ID)
+    pid_path = runtime_dir() / f"fftabs-{prefix}.sock"
+    if pid_path.exists():
+        return pid_path, tid
+
+    # Match prefix against connected hosts' profile names / slugs
+    matched_socks = []
+    for p in socks:
+        try:
+            r = rpc(p, {"cmd": "ping"})
+        except (OSError, ValueError):
+            continue
+        profile = (r if isinstance(r, dict) else {}).get("profile") or {}
+        name = profile.get("name") or sock_pid(p)
+        slug = slugify(name)
+        pid = sock_pid(p)
+        if prefix.lower() in (slug.lower(), f"{slug}-{pid}".lower(), name.lower()):
+            matched_socks.append(p)
+
+    if len(matched_socks) == 1:
+        return matched_socks[0], tid
+    if len(matched_socks) > 1:
+        die(f"ambiguous profile {prefix!r}: matches {len(matched_socks)} hosts; use PID:ID instead")
+    die(f"no Firefox profile matching {prefix!r} (try `fftabs list`)")
+
+
+def switch_to(path: Path, tab_id: int, firefox_pid: int | None = None) -> None:
+    try:
+        r = rpc(path, {"cmd": "switch", "tabId": tab_id})
+    except (OSError, ValueError) as e:
+        die(f"switch failed: {e}")
+    if not r.get("ok"):
+        die(f"switch failed: {r.get('error')}")
+    pid = (r.get("profile") or {}).get("firefox_pid") or firefox_pid
+    focus_firefox_window(sanitize((r.get("result") or {}).get("title")), firefox_pid=pid)
+
+
+def close_tab(path: Path, tab_id: int) -> None:
+    try:
+        r = rpc(path, {"cmd": "close", "tabId": tab_id})
+    except (OSError, ValueError) as e:
+        die(f"close failed: {e}")
+    if not r.get("ok"):
+        die(f"close failed: {r.get('error')}")
+
+
+# ----------------------------------------------------------------------------
+# favicons -> files rofi can show
+# ----------------------------------------------------------------------------
+
+ICON_MAX_BYTES = 512 * 1024
+HIT_TTL = 30 * 86400
+MISS_TTL = 86400
+
+
+def _icon_dir() -> Path:
+    return cache_dir() / "icons"
+
+
+def _icon_key(url: str) -> str:
+    return hashlib.sha1(url.encode("utf-8", "replace")).hexdigest()
+
+
+def _sniff(data: bytes) -> str | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:4] == b"\x00\x00\x01\x00":
+        return "ico"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    head = data[:2048].lower()
+    if b"<svg" in head and b"<html" not in head:
+        return "svg"
+    return None  # e.g. an HTML 404 page served instead of an icon
+
+
+def _to_png(data: bytes, ext: str) -> bytes | None:
+    """ICO/WEBP -> PNG via Pillow when it is installed (gdk-pixbuf coverage is patchy)."""
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(data))
+        if ext == "ico":
+            im.size = max(im.ico.sizes())
+        out = io.BytesIO()
+        im.convert("RGBA").save(out, "PNG")
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def _decode_data_uri(uri: str) -> bytes:
+    head, _, payload = uri[5:].partition(",")
+    if "base64" in head.split(";"):
+        payload = urllib.parse.unquote(payload)
+        payload += "=" * (-len(payload) % 4)
+        return base64.b64decode(payload)
+    return urllib.parse.unquote_to_bytes(payload)
+
+
+def _store(key: str, ext: str, data: bytes) -> None:
+    d = _icon_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    for old in d.glob(key + ".*"):
+        old.unlink(missing_ok=True)
+    tmp = d / f".{key}.{os.getpid()}.{threading.get_ident()}.tmp"
+    tmp.write_bytes(data)
+    tmp.replace(d / f"{key}.{ext}")
+
+
+def fetch_icon(url: str) -> None:
+    key = _icon_key(url)
+    data = None
+    try:
+        if url.startswith("data:"):
+            data = _decode_data_uri(url)
+        elif url.startswith(("http://", "https://")):
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0 (fftabs)", "Accept": "image/*,*/*;q=0.5"}
+            )
+            with urllib.request.urlopen(req, timeout=3) as r:
+                data = r.read(ICON_MAX_BYTES + 1)
+    except Exception:
+        data = None
+    if data is not None and len(data) > ICON_MAX_BYTES:
+        data = None
+    ext = _sniff(data) if data else None
+    if ext in ("ico", "webp"):
+        png = _to_png(data, ext)
+        if png:
+            data, ext = png, "png"
+        elif ext == "webp":
+            ext = None  # most gdk-pixbuf builds cannot load it
+    try:
+        _store(key, ext or "miss", data if ext else b"")
+    except OSError:
+        pass
+
+
+def cached_icon(url: str) -> tuple[str, str | None]:
+    """('hit', path) | ('miss', None) | ('none', None) = not cached / expired."""
+    if not url:
+        return "miss", None
+    now = time.time()
+    for p in _icon_dir().glob(_icon_key(url) + ".*"):
+        age = now - p.stat().st_mtime
+        if p.suffix == ".miss":
+            return ("miss", None) if age < MISS_TTL else ("none", None)
+        if age < HIT_TTL:
+            return "hit", str(p)
+    return "none", None
+
+
+def prefetch_icons(urls: set[str], allow_network: bool, deadline: float = 2.5) -> None:
+    todo = [
+        u
+        for u in urls
+        if u
+        and cached_icon(u)[0] == "none"
+        and (u.startswith("data:") or (allow_network and u.startswith(("http://", "https://"))))
+    ]
+    if not todo:
+        return
+    sem = threading.Semaphore(12)
+
+    def work(u: str) -> None:
+        with sem:
+            fetch_icon(u)
+
+    threads = [threading.Thread(target=work, args=(u,), daemon=True) for u in todo]
+    for t in threads:
+        t.start()
+    end = time.monotonic() + deadline
+    for t in threads:
+        t.join(max(0.0, end - time.monotonic()))
+
+
+# ----------------------------------------------------------------------------
+# putting the Firefox window in front (compositor side)
+# ----------------------------------------------------------------------------
+
+APP_RE = re.compile(
+    os.environ.get("FFTABS_APP_RE", r"^(org\.mozilla\.)?(firefox|librewolf|floorp|waterfox|zen)([-.].*)?$"),
+    re.I,
+)
+
+
+def _run(cmd: list[str]) -> str | None:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _sway_windows() -> list[dict]:
+    out = _run(["swaymsg", "-t", "get_tree", "-r"])
+    if not out:
+        return []
+    found: list[dict] = []
+
+    def walk(n: dict) -> None:
+        kids = n.get("nodes", []) + n.get("floating_nodes", [])
+        for c in kids:
+            walk(c)
+        if not kids and n.get("type") in ("con", "floating_con"):
+            app = n.get("app_id") or (n.get("window_properties") or {}).get("class") or ""
+            if app:
+                found.append({"id": n["id"], "title": n.get("name") or "", "app": app, "pid": n.get("pid")})
+
+    walk(json.loads(out))
+    return found
+
+
+def _hypr_windows() -> list[dict]:
+    out = _run(["hyprctl", "clients", "-j"])
+    if not out:
+        return []
+    return [
+        {"id": c["address"], "title": c.get("title", ""), "app": c.get("class", ""), "pid": c.get("pid")}
+        for c in json.loads(out)
+    ]
+
+
+def _niri_windows() -> list[dict]:
+    out = _run(["niri", "msg", "--json", "windows"])
+    if not out:
+        return []
+    return [
+        {"id": w["id"], "title": w.get("title") or "", "app": w.get("app_id") or "", "pid": w.get("pid")}
+        for w in json.loads(out)
+    ]
+
+
+BACKENDS = {
+    "sway": (_sway_windows, lambda i: ["swaymsg", f"[con_id={i}] focus"]),
+    "hyprland": (_hypr_windows, lambda i: ["hyprctl", "dispatch", "focuswindow", f"address:{i}"]),
+    "niri": (_niri_windows, lambda i: ["niri", "msg", "action", "focus-window", "--id", str(i)]),
+}
+
+
+def _detect_backend() -> str | None:
+    if os.environ.get("SWAYSOCK"):
+        return "sway"
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "hyprland"
+    if os.environ.get("NIRI_SOCKET"):
+        return "niri"
+    return None
+
+
+def focus_firefox_window(title: str, firefox_pid: int | None = None) -> None:
+    """Firefox cannot reliably raise itself on Wayland, so ask the compositor.
+
+    One Firefox window -> focus it. Several -> focus the one whose title contains the
+    tab title (Firefox titles windows after their active tab). When firefox_pid is provided,
+    first filter compositor windows by PID to target the correct profile.
+    FFTABS_FOCUS_CMD overrides everything (run through the shell, tab title in $FFTABS_TITLE);
+    FFTABS_NO_FOCUS=1 skips.
+    """
+    if os.environ.get("FFTABS_NO_FOCUS"):
+        return
+    custom = os.environ.get("FFTABS_FOCUS_CMD")
+    if custom:
+        subprocess.run(custom, shell=True, env={**os.environ, "FFTABS_TITLE": title})
+        return
+    name = _detect_backend()
+    if not name:
+        return
+    list_windows, focus_cmd = BACKENDS[name]
+    deadline = time.monotonic() + 0.6  # window titles lag the tab switch slightly
+    pick = None
+    while True:
+        all_wins = [w for w in list_windows() if APP_RE.search(w["app"])]
+        wins = all_wins
+        if firefox_pid is not None:
+            pid_wins = [w for w in all_wins if w.get("pid") == firefox_pid]
+            if pid_wins:
+                wins = pid_wins
+        if len(wins) == 1:
+            pick = wins[0]
+            break
+        pick = next((w for w in wins if title and title in w["title"]), None)
+        if pick or not wins or time.monotonic() > deadline:
+            break
+        time.sleep(0.07)
+    if pick:
+        _run(focus_cmd(pick["id"]))
+
+
+# ----------------------------------------------------------------------------
+# commands
+# ----------------------------------------------------------------------------
+
+def site_of(url: str) -> str:
+    p = urllib.parse.urlparse(url)
+    if p.scheme in ("http", "https") and p.hostname:
+        return re.sub(r"^www\.", "", p.hostname)
+    return truncate(url, 60)
+
+
+def build_payload(tabs: list[dict], no_icons: bool) -> bytes:
+    multi_win = len({(t.get("_profile_slug", t["_pid"]), t["window"]["id"]) for t in tabs}) > 1
+    multi_profile = len({t.get("_profile_slug", t["_pid"]) for t in tabs}) > 1
+    out = bytearray()
+    for t in tabs:
+        url = sanitize(t.get("url"))
+        title = truncate(sanitize(t.get("title")) or url or "(untitled)", 90)
+        site = site_of(url)
+        tags = [] if site == title else [site]
+        if t["current"]:
+            tags.append("current")
+        if t.get("pinned"):
+            tags.append("pinned")
+        if t.get("audible"):
+            tags.append("audio")
+        elif t.get("muted"):
+            tags.append("muted")
+        if t.get("discarded"):
+            tags.append("unloaded")
+        if t.get("container"):
+            tags.append(sanitize(t["container"]["name"]))
+        if t["window"].get("private"):
+            tags.append("private")
+        if multi_profile:
+            prof_name = t.get("_profile_name", t["_pid"])
+            if multi_win:
+                tags.append(f"{prof_name}/win {t['window']['n']}")
+            else:
+                tags.append(prof_name)
+        elif multi_win:
+            tags.append(f"win {t['window']['n']}")
+        row = "{}  <span alpha='55%' size='small'>{}</span>".format(
+            html.escape(title, quote=False), html.escape(" \u00b7 ".join(tags), quote=False)
+        )
+        opts: list[str] = []
+        if not no_icons:
+            state, path = cached_icon(t.get("favIconUrl", ""))
+            opts += ["icon", path if state == "hit" else FALLBACK_ICON]
+        opts += ["meta", f"{title} {url} {(t.get('container') or {}).get('name', '')} {t.get('_profile_name', '')}"]
+        out += row.encode() + b"\0" + "\x1f".join(opts).encode() + b"\n"
+    return bytes(out)
+
+
+def cmd_rofi(args, extra) -> int:
+    if not shutil.which("rofi"):
+        die("rofi not found in PATH")
+    allow_net = not (args.no_fetch or os.environ.get("FFTABS_NO_FETCH"))
+    sel = 1 if args.previous else 0
+    while True:
+        tabs = ordered(fetch_tabs(), args.sort)
+        if getattr(args, "profile", None):
+            slug = slugify(args.profile)
+            tabs = [t for t in tabs if t["_profile_slug"] == slug
+                    or t["_profile_name"].lower() == args.profile.lower()]
+            if not tabs:
+                die(f"no profile matching {args.profile!r}")
+            for t in tabs:
+                t["ref"] = str(t["id"])
+        if not args.no_icons:
+            prefetch_icons({t.get("favIconUrl", "") for t in tabs}, allow_net)
+        cmd = [
+            "rofi", "-dmenu", "-i", "-p", "tabs", "-markup-rows", "-no-custom",
+            "-format", "i", "-kb-custom-1", "Alt+d",
+            "-mesg", "<b>Enter</b> switch  \u00b7  <b>Alt+d</b> close tab",
+        ]
+        if not args.no_icons:
+            cmd.append("-show-icons")
+        if sel:
+            cmd += ["-selected-row", str(min(sel, len(tabs) - 1))]
+        res = subprocess.run(
+            cmd + extra, input=build_payload(tabs, args.no_icons), stdout=subprocess.PIPE
+        )
+        try:
+            idx = int(res.stdout.decode().strip())
+            tab = tabs[idx]
+        except (ValueError, IndexError):
+            return 1  # cancelled (or rofi failed)
+        path = Path(tab["_sock"])
+        if res.returncode == 0:
+            switch_to(path, tab["id"], firefox_pid=tab.get("_firefox_pid"))
+            return 0
+        if res.returncode == 10:  # Alt+d: close, then show the menu again
+            close_tab(path, tab["id"])
+            sel = idx
+            continue
+        return 1
+
+
+def cmd_list(args, _extra) -> int:
+    tabs = ordered(fetch_tabs(), args.sort)
+    if getattr(args, "profile", None):
+        slug = slugify(args.profile)
+        tabs = [t for t in tabs if t["_profile_slug"] == slug
+                or t["_profile_name"].lower() == args.profile.lower()]
+        if not tabs:
+            die(f"no profile matching {args.profile!r}")
+        for t in tabs:
+            t["ref"] = str(t["id"])
+    if args.json:
+        keep = []
+        for t in tabs:
+            d = {k: v for k, v in t.items() if not k.startswith("_")}
+            d["profile"] = t.get("_profile_name", t["_pid"])
+            d["profile_slug"] = t.get("_profile_slug", "")
+            d["pid"] = int(t["_pid"]) if t["_pid"].isdigit() else t["_pid"]
+            d["firefox_pid"] = t.get("_firefox_pid")
+            keep.append(d)
+        json.dump(keep, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+        return 0
+    for t in tabs:  # ref <TAB> profile <TAB> window <TAB> current? <TAB> title <TAB> url
+        print("\t".join([
+            t["ref"], t.get("_profile_name", t["_pid"]), str(t["window"]["n"]),
+            "*" if t["current"] else "-",
+            sanitize(t["title"]), sanitize(t["url"]),
+        ]))
+    return 0
+
+
+def cmd_switch(args, _extra) -> int:
+    path, tid = resolve_ref(args.ref)
+    switch_to(path, tid)
+    return 0
+
+
+def cmd_close(args, _extra) -> int:
+    path, tid = resolve_ref(args.ref)
+    close_tab(path, tid)
+    return 0
+
+
+def _wrapper_path() -> Path:
+    return data_dir() / "fftabs-host"
+
+
+def cmd_install(args, _extra) -> int:
+    script = Path(__file__).resolve()
+    wrapper = _wrapper_path()
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(
+        "#!/bin/sh\nexec {} {} host\n".format(shlex.quote(sys.executable), shlex.quote(str(script)))
+    )
+    wrapper.chmod(0o755)
+    mdir = Path(args.manifest_dir or DEFAULT_MANIFEST_DIR).expanduser()
+    mdir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "name": HOST_NAME,
+        "description": "fftabs: lets the fftabs CLI list and switch Firefox tabs",
+        "path": str(wrapper),
+        "type": "stdio",
+        "allowed_extensions": ALLOWED_EXTENSIONS,
+    }
+    (mdir / f"{HOST_NAME}.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"wrote {mdir / (HOST_NAME + '.json')}")
+    print(f"wrote {wrapper}  ->  {script}")
+    print("next: load extension/ in Firefox (see README), then run `fftabs status`")
+    return 0
+
+
+def cmd_uninstall(args, _extra) -> int:
+    mdir = Path(args.manifest_dir or DEFAULT_MANIFEST_DIR).expanduser()
+    for p in (mdir / f"{HOST_NAME}.json", _wrapper_path()):
+        if p.exists():
+            p.unlink()
+            print(f"removed {p}")
+    return 0
+
+
+def cmd_status(args, _extra) -> int:
+    mpath = Path(args.manifest_dir or DEFAULT_MANIFEST_DIR).expanduser() / f"{HOST_NAME}.json"
+    print(f"native manifest : {'ok' if mpath.exists() else 'MISSING'}  ({mpath})")
+    print(f"host wrapper    : {'ok' if _wrapper_path().exists() else 'MISSING'}  ({_wrapper_path()})")
+    print(f"rofi            : {shutil.which('rofi') or 'MISSING'}")
+    try:
+        import PIL  # noqa: F401
+        print("Pillow          : yes (ICO/WEBP favicons are converted to PNG)")
+    except ImportError:
+        print("Pillow          : no  (optional; python-pillow converts ICO/WEBP favicons)")
+    print(f"compositor      : {_detect_backend() or 'unknown (set FFTABS_FOCUS_CMD to focus Firefox)'}")
+    socks = sockets()
+    if not socks:
+        print("firefox         : NOT CONNECTED (extension not loaded, or Firefox not running)")
+        return 1
+    for p in socks:
+        try:
+            r = rpc(p, {"cmd": "ping"}, timeout=5)
+            state = "ok" if r.get("ok") else f"error: {r.get('error')}"
+            profile = (r.get("profile") or {}).get("name")
+            if profile and r.get("ok"):
+                state = f"ok  profile={profile}"
+        except ConnectionRefusedError:
+            p.unlink(missing_ok=True)
+            continue
+        except (OSError, ValueError) as e:
+            state = f"error: {e}"
+        print(f"firefox         : host pid {sock_pid(p)}  {state}")
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    extra: list[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    if not argv:
+        argv = ["rofi"]
+
+    ap = argparse.ArgumentParser(prog="fftabs", description="List and switch Firefox tabs (rofi front-end).")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("rofi", help="pick a tab with rofi (default); args after -- go to rofi")
+    p.add_argument("--sort", choices=["recent", "window"], default="recent")
+    p.add_argument("--previous", action="store_true", help="preselect the previous tab (alt-tab style)")
+    p.add_argument("--no-icons", action="store_true")
+    p.add_argument("--no-fetch", action="store_true", help="never download favicons (cached/data: only)")
+    p.add_argument("--profile", metavar="NAME", help="show only tabs from this profile")
+    p.set_defaults(fn=cmd_rofi)
+
+    p = sub.add_parser("list", help="print tabs (TSV: ref, profile, window, current, title, url)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--sort", choices=["recent", "window"], default="window")
+    p.add_argument("--profile", metavar="NAME", help="show only tabs from this profile")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("switch", help="activate a tab and focus its window")
+    p.add_argument("ref", help="ID, profile:ID, or PID:ID from `fftabs list`")
+    p.set_defaults(fn=cmd_switch)
+
+    p = sub.add_parser("close", help="close a tab")
+    p.add_argument("ref", help="ID, profile:ID, or PID:ID from `fftabs list`")
+    p.set_defaults(fn=cmd_close)
+
+    for name, fn, text in (
+        ("status", cmd_status, "check the whole chain"),
+        ("install", cmd_install, "register the native messaging host with Firefox"),
+        ("uninstall", cmd_uninstall, "remove the native messaging host registration"),
+    ):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("--manifest-dir", help=f"native-messaging-hosts dir (default {DEFAULT_MANIFEST_DIR})")
+        p.set_defaults(fn=fn)
+
+    p = sub.add_parser("host", help=argparse.SUPPRESS)  # started by Firefox, not by you
+    p.set_defaults(fn=cmd_host)
+
+    args = ap.parse_args(argv)
+    return args.fn(args, extra)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
