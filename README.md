@@ -91,8 +91,8 @@ sudo pacman -S python rofi-wayland python-pillow
 Clone the repository and register the native messaging host:
 
 ```bash
-git clone https://github.com/laperex/firefox_tab_switcher.git
-cd firefox_tab_switcher
+git clone https://github.com/laperex/fftabs.git
+cd fftabs
 
 # Registers host wrapper in ~/.local/share/fftabs/ and manifest in ~/.mozilla/native-messaging-hosts/
 ./fftabs install
@@ -230,7 +230,7 @@ In `extension/manifest.json`, add the `update_url` property pointing to a hosted
     "gecko": {
       "id": "fftabs@laperex",
       "strict_min_version": "140.0",
-      "update_url": "https://raw.githubusercontent.com/laperex/firefox_tab_switcher/main/updates.json"
+      "update_url": "https://raw.githubusercontent.com/laperex/fftabs/main/updates.json"
     }
   }
 }
@@ -247,7 +247,7 @@ Place an `updates.json` file in your repository root or hosting server using Moz
       "updates": [
         {
           "version": "0.1.3",
-          "update_link": "https://github.com/laperex/firefox_tab_switcher/releases/download/v0.1.3/fftabs-0.1.3.xpi"
+          "update_link": "https://github.com/laperex/fftabs/releases/download/v0.1.3/fftabs-0.1.3.xpi"
         }
       ]
     }
@@ -330,8 +330,8 @@ Contributions, bug reports, and pull requests are welcome.
 ### Development Setup
 1. Clone the repository:
    ```bash
-   git clone https://github.com/laperex/firefox_tab_switcher.git
-   cd firefox_tab_switcher
+   git clone https://github.com/laperex/fftabs.git
+   cd fftabs
    ```
 2. Run the test suite:
    ```bash
