@@ -33,7 +33,7 @@ import urllib.request
 from pathlib import Path
 
 HOST_NAME = "fftabs"
-ALLOWED_EXTENSIONS = ["fftabs@krishnadev7777"]
+ALLOWED_EXTENSIONS = ["fftabs@laperex"]
 DEFAULT_MANIFEST_DIR = "~/.mozilla/native-messaging-hosts"
 FALLBACK_ICON = "firefox"  # icon-theme name used when a tab has no usable favicon
 
