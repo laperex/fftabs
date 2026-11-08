@@ -51,6 +51,12 @@ async function handle(msg) {
       return switchTab(msg.tabId);
     case "close":
       return closeTab(msg.tabId);
+    case "close-tabs":
+      return closeTabs(msg.scope, msg.tabId, msg.keepPinned !== false);
+    case "new-tab":
+      return newTab(msg.url, msg.windowId, msg.cookieStoreId);
+    case "history":
+      return searchHistory(msg.query, msg.limit);
     default:
       throw new Error("unknown command: " + msg.cmd);
   }
@@ -108,6 +114,60 @@ async function switchTab(tabId) {
 async function closeTab(tabId) {
   await browser.tabs.remove(tabId);
   return true;
+}
+
+async function closeTabs(scope, tabId, keepPinned = true) {
+  const tab = await browser.tabs.get(tabId);
+  if (!tab) return { closed: 0, ids: [] };
+  const winTabs = await browser.tabs.query({ windowId: tab.windowId });
+  let toRemove = [];
+  if (scope === "others") {
+    toRemove = winTabs.filter(t => t.id !== tabId && (!keepPinned || !t.pinned));
+  } else if (scope === "right") {
+    toRemove = winTabs.filter(t => t.index > tab.index && (!keepPinned || !t.pinned));
+  } else if (scope === "left") {
+    toRemove = winTabs.filter(t => t.index < tab.index && (!keepPinned || !t.pinned));
+  } else {
+    toRemove = [tab];
+  }
+  const ids = toRemove.map(t => t.id);
+  if (ids.length > 0) {
+    await browser.tabs.remove(ids);
+  }
+  return { closed: ids.length, ids: ids };
+}
+
+async function newTab(url, windowId, cookieStoreId) {
+  const createProps = { active: true };
+  if (url) createProps.url = url;
+  if (windowId) createProps.windowId = windowId;
+  if (cookieStoreId) createProps.cookieStoreId = cookieStoreId;
+  const tab = await browser.tabs.create(createProps);
+  if (tab.windowId) {
+    try {
+      await browser.windows.update(tab.windowId, { focused: true });
+    } catch (e) {}
+  }
+  return { tabId: tab.id, windowId: tab.windowId };
+}
+
+async function searchHistory(query, limit = 50) {
+  if (!browser.history) return [];
+  try {
+    const items = await browser.history.search({
+      text: query || "",
+      maxResults: limit || 50,
+      startTime: 0,
+    });
+    return items.map(item => ({
+      title: item.title || item.url || "",
+      url: item.url || "",
+      visitCount: item.visitCount || 0,
+      lastVisitTime: item.lastVisitTime || 0,
+    }));
+  } catch (e) {
+    return [];
+  }
 }
 
 connect();

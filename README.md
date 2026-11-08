@@ -185,7 +185,59 @@ fftabs rofi -- -theme ~/.config/rofi/my-theme.rasi
 #### Keyboard Shortcuts in Rofi:
 - **`Enter`**: Switch to the highlighted tab and focus its containing window.
 - **`Alt+d`**: Close the highlighted tab in the background without dismissing the picker.
+- **`Alt+o`**: Close all other tabs in the same window (with preview confirmation).
+- **`Alt+r`**: Close tabs to the right of the highlighted tab on the window's tab bar.
+- **`Alt+l`**: Close tabs to the left of the highlighted tab on the window's tab bar.
+- **`Alt+n`**: Open the new tab prompt with history autocomplete and DuckDuckGo search.
 - **`Esc`**: Dismiss the switcher.
+
+---
+
+### Opening New Tabs & Autocomplete
+
+`fftabs` allows opening URLs or search queries in the currently focused (or MRU) Firefox window:
+
+```bash
+# Interactive new tab prompt with browsing history autocomplete
+fftabs open
+fftabs new
+
+# Open a URL directly in the focused window
+fftabs open github.com
+fftabs open https://docs.rs/tokio
+
+# Search with DuckDuckGo in a new tab
+fftabs open "arch linux wayland"
+
+# Target a specific profile
+fftabs open --profile work https://intranet.company.com
+```
+
+---
+
+### Scoped Tab Closing
+
+In addition to closing individual tabs, `fftabs` supports closing groups of tabs in a window:
+
+```bash
+# Close all other tabs in the same window (preserves pinned tabs)
+fftabs close-others work:42
+fftabs close work:42 --others
+
+# Close tabs to the right of the target tab on the tab bar
+fftabs close-right 42
+fftabs close 42 --right
+
+# Close tabs to the left of the target tab on the tab bar
+fftabs close-left 42
+fftabs close 42 --left
+
+# Skip interactive confirmation with -y
+fftabs close-right 42 -y
+
+# Also close pinned tabs
+fftabs close-others 42 --close-pinned
+```
 
 ---
 

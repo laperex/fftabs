@@ -489,5 +489,90 @@ class TestTabOrdering(unittest.TestCase):
         self.assertEqual(fftabs.ordered([], "recent"), [])
 
 
+class TestScopedTabClosing(unittest.TestCase):
+    def setUp(self):
+        # Window 101 with 5 tabs (indices 0 to 4)
+        self.tabs = [
+            {"id": 10, "index": 0, "title": "Tab 0 (pinned)", "pinned": True, "window": {"id": 101, "n": 1}},
+            {"id": 11, "index": 1, "title": "Tab 1", "pinned": False, "window": {"id": 101, "n": 1}},
+            {"id": 12, "index": 2, "title": "Tab 2 (target)", "pinned": False, "window": {"id": 101, "n": 1}},
+            {"id": 13, "index": 3, "title": "Tab 3", "pinned": False, "window": {"id": 101, "n": 1}},
+            {"id": 14, "index": 4, "title": "Tab 4", "pinned": False, "window": {"id": 101, "n": 1}},
+            # Window 102 with 1 tab
+            {"id": 20, "index": 0, "title": "Other Win Tab", "pinned": False, "window": {"id": 102, "n": 2}},
+        ]
+        self.target = self.tabs[2]  # Tab 2 (id: 12, index: 2)
+
+    def test_compute_scoped_others(self):
+        # Others in Window 101 (skipping pinned tab 0 and target tab 2)
+        to_close = fftabs.compute_scoped_tabs(self.tabs, self.target, "others", keep_pinned=True)
+        self.assertEqual([t["id"] for t in to_close], [11, 13, 14])
+
+        # If keep_pinned=False, includes tab 0
+        to_close_pinned = fftabs.compute_scoped_tabs(self.tabs, self.target, "others", keep_pinned=False)
+        self.assertEqual([t["id"] for t in to_close_pinned], [10, 11, 13, 14])
+
+    def test_compute_scoped_right(self):
+        # Tabs to the right of Tab 2: Tab 3 and Tab 4
+        to_close = fftabs.compute_scoped_tabs(self.tabs, self.target, "right", keep_pinned=True)
+        self.assertEqual([t["id"] for t in to_close], [13, 14])
+
+    def test_compute_scoped_left(self):
+        # Tabs to the left of Tab 2: Tab 1 (Tab 0 is pinned, so excluded)
+        to_close = fftabs.compute_scoped_tabs(self.tabs, self.target, "left", keep_pinned=True)
+        self.assertEqual([t["id"] for t in to_close], [11])
+
+        # If keep_pinned=False, includes Tab 0
+        to_close_pinned = fftabs.compute_scoped_tabs(self.tabs, self.target, "left", keep_pinned=False)
+        self.assertEqual([t["id"] for t in to_close_pinned], [10, 11])
+
+
+class TestUrlAndSearchResolution(unittest.TestCase):
+    def test_explicit_urls(self):
+        self.assertEqual(fftabs.resolve_url_or_search("https://example.com"), "https://example.com")
+        self.assertEqual(fftabs.resolve_url_or_search("http://localhost:8080/foo"), "http://localhost:8080/foo")
+        self.assertEqual(fftabs.resolve_url_or_search("about:config"), "about:config")
+
+    def test_domain_names(self):
+        self.assertEqual(fftabs.resolve_url_or_search("github.com"), "https://github.com")
+        self.assertEqual(fftabs.resolve_url_or_search("news.ycombinator.com/item?id=123"), "https://news.ycombinator.com/item?id=123")
+        self.assertEqual(fftabs.resolve_url_or_search("localhost:3000"), "https://localhost:3000")
+
+    def test_search_queries(self):
+        res = fftabs.resolve_url_or_search("python asyncio tutorial")
+        self.assertEqual(res, "https://duckduckgo.com/?q=python+asyncio+tutorial")
+
+    def test_empty_string(self):
+        self.assertEqual(fftabs.resolve_url_or_search(""), "about:newtab")
+
+
+class TestHistoryCache(unittest.TestCase):
+    def test_record_and_merge_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch("fftabs.cache_dir", return_value=Path(td)):
+                tabs = [
+                    {"url": "https://a.com", "title": "A", "favIconUrl": "", "lastAccessed": 1000},
+                    {"url": "https://b.com", "title": "B", "favIconUrl": "", "lastAccessed": 2000},
+                ]
+                fftabs.record_history(tabs)
+                hfile = Path(td) / "history.json"
+                self.assertTrue(hfile.exists())
+                data = json.loads(hfile.read_text())
+                self.assertEqual(len(data), 2)
+                # B has higher lastAccessed, should be first
+                self.assertEqual(data[0]["url"], "https://b.com")
+
+                # Test fetch_combined_history reading from cache
+                with patch("fftabs.sockets", return_value=[]):
+                    combined = fftabs.fetch_combined_history()
+                    self.assertEqual(len(combined), 2)
+                    self.assertEqual(combined[0]["url"], "https://b.com")
+
+                    # Test query filtering
+                    filtered = fftabs.fetch_combined_history(query="b.com")
+                    self.assertEqual(len(filtered), 1)
+                    self.assertEqual(filtered[0]["url"], "https://b.com")
+
+
 if __name__ == "__main__":
     unittest.main()

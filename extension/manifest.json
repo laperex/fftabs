@@ -16,7 +16,7 @@
       }
     }
   },
-  "permissions": ["tabs", "nativeMessaging", "contextualIdentities"],
+  "permissions": ["tabs", "nativeMessaging", "contextualIdentities", "history"],
   "background": {
     "scripts": ["background.js"]
   }
