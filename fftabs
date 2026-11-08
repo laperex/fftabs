@@ -446,10 +446,58 @@ def fetch_tabs() -> list[dict]:
     return tabs
 
 
+SORT_CHOICES = ["window-recent", "window", "recent", "window-index", "window-num"]
+
+
 def ordered(tabs: list[dict], mode: str) -> list[dict]:
-    if mode == "window":
-        return sorted(tabs, key=lambda t: (t.get("_profile_slug", ""), t["window"]["n"], t["index"]))
-    return sorted(tabs, key=lambda t: -(t.get("lastAccessed") or 0))
+    if not tabs:
+        return []
+
+    if mode == "recent":
+        # Pure tab-level MRU across all windows and profiles
+        return sorted(tabs, key=lambda t: (-(t.get("lastAccessed") or 0), t.get("index", 0)))
+
+    if mode == "window-num":
+        # Static window number ordering (win 1, win 2...), then tab index
+        return sorted(tabs, key=lambda t: (t.get("_profile_slug", ""), (t.get("window") or {}).get("n", 0), t.get("index", 0)))
+
+    # Window recency modes ("window-recent", "window", "window-index"):
+    # Group tabs by window: (profile_slug, window_id)
+    # Recency score per window: (is_currently_focused: int, max_last_accessed: int)
+    win_recency: dict[tuple[str, int], tuple[int, int]] = {}
+    for t in tabs:
+        w = t.get("window") or {}
+        win_key = (t.get("_profile_slug", ""), w.get("id", 0))
+        is_foc = 1 if w.get("focused") else 0
+        acc = t.get("lastAccessed") or 0
+        if win_key not in win_recency:
+            win_recency[win_key] = (is_foc, acc)
+        else:
+            prev_foc, prev_acc = win_recency[win_key]
+            win_recency[win_key] = (max(prev_foc, is_foc), max(prev_acc, acc))
+
+    if mode == "window-index":
+        # Most recently viewed window first; within each window, tabs ordered by tab-bar position (index)
+        return sorted(
+            tabs,
+            key=lambda t: (
+                -win_recency[(t.get("_profile_slug", ""), (t.get("window") or {}).get("id", 0))][0],
+                -win_recency[(t.get("_profile_slug", ""), (t.get("window") or {}).get("id", 0))][1],
+                t.get("index", 0),
+            ),
+        )
+
+    # Default ("window-recent" / "window"):
+    # Most recently viewed window first; within each window, tabs ordered by MRU (lastAccessed), then index
+    return sorted(
+        tabs,
+        key=lambda t: (
+            -win_recency[(t.get("_profile_slug", ""), (t.get("window") or {}).get("id", 0))][0],
+            -win_recency[(t.get("_profile_slug", ""), (t.get("window") or {}).get("id", 0))][1],
+            -(t.get("lastAccessed") or 0),
+            t.get("index", 0),
+        ),
+    )
 
 
 def resolve_ref(ref: str) -> tuple[Path, int]:
@@ -1006,7 +1054,10 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("rofi", help="pick a tab with rofi (default); args after -- go to rofi")
-    p.add_argument("--sort", choices=["recent", "window"], default="recent")
+    p.add_argument("--sort", choices=SORT_CHOICES, default="window-recent",
+                   help="sort order: window-recent (default: MRU window first + tab MRU inside), "
+                        "recent (pure tab MRU), window-index (MRU window + tab index), "
+                        "window-num (static window order)")
     p.add_argument("--previous", action="store_true", help="preselect the previous tab (alt-tab style)")
     p.add_argument("--no-icons", action="store_true")
     p.add_argument("--no-fetch", action="store_true", help="never download favicons (cached/data: only)")
@@ -1015,7 +1066,8 @@ def main() -> int:
 
     p = sub.add_parser("list", help="print tabs (TSV: ref, profile, window, current, title, url)")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--sort", choices=["recent", "window"], default="window")
+    p.add_argument("--sort", choices=SORT_CHOICES, default="window-recent",
+                   help="sort order: window-recent (default), recent, window-index, window-num")
     p.add_argument("--profile", metavar="NAME", help="show only tabs from this profile")
     p.set_defaults(fn=cmd_list)
 

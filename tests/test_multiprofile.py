@@ -405,5 +405,89 @@ class TestMultiProfileIntegration(unittest.TestCase):
             ff.stop()
 
 
+class TestTabOrdering(unittest.TestCase):
+    def setUp(self):
+        # Window 1: older tabs
+        self.t1_1 = {
+            "id": 1, "index": 0, "title": "W1 Tab 0", "url": "https://a.com",
+            "lastAccessed": 1000, "window": {"id": 101, "n": 1, "focused": False},
+            "_profile_slug": "prof1"
+        }
+        self.t1_2 = {
+            "id": 2, "index": 1, "title": "W1 Tab 1", "url": "https://b.com",
+            "lastAccessed": 2000, "window": {"id": 101, "n": 1, "focused": False},
+            "_profile_slug": "prof1"
+        }
+        # Window 2: newer tabs
+        self.t2_1 = {
+            "id": 3, "index": 0, "title": "W2 Tab 0", "url": "https://c.com",
+            "lastAccessed": 3000, "window": {"id": 102, "n": 2, "focused": False},
+            "_profile_slug": "prof1"
+        }
+        self.t2_2 = {
+            "id": 4, "index": 1, "title": "W2 Tab 1", "url": "https://d.com",
+            "lastAccessed": 4000, "window": {"id": 102, "n": 2, "focused": False},
+            "_profile_slug": "prof1"
+        }
+        self.all_tabs = [self.t1_1, self.t1_2, self.t2_1, self.t2_2]
+
+    def test_window_recent_orders_mru_window_first_and_tabs_mru(self):
+        # Window 2 has max access 4000 > Window 1 max access 2000.
+        # Window 2 must come first, and within Window 2: t2_2 (4000) before t2_1 (3000).
+        # Within Window 1: t1_2 (2000) before t1_1 (1000).
+        res = fftabs.ordered(self.all_tabs, "window-recent")
+        self.assertEqual([t["id"] for t in res], [4, 3, 2, 1])
+
+        # "window" is an alias for "window-recent"
+        res_alias = fftabs.ordered(self.all_tabs, "window")
+        self.assertEqual([t["id"] for t in res_alias], [4, 3, 2, 1])
+
+    def test_focused_window_has_highest_priority(self):
+        # Even if Window 1 has lower timestamps, if it is focused, it must be first
+        t1_1_foc = dict(self.t1_1, window={"id": 101, "n": 1, "focused": True})
+        t1_2_foc = dict(self.t1_2, window={"id": 101, "n": 1, "focused": True})
+        tabs = [self.t2_1, self.t2_2, t1_1_foc, t1_2_foc]
+
+        res = fftabs.ordered(tabs, "window-recent")
+        # Window 1 tabs first (t1_2 with 2000, t1_1 with 1000), then Window 2 (t2_2 with 4000, t2_1 with 3000)
+        self.assertEqual([t["id"] for t in res], [2, 1, 4, 3])
+
+    def test_window_index_mode(self):
+        # Window 2 has max timestamp 4000 > Window 1, so Window 2 is first.
+        # But tabs inside are ordered by index: t2_1 (idx 0) before t2_2 (idx 1).
+        res = fftabs.ordered(self.all_tabs, "window-index")
+        self.assertEqual([t["id"] for t in res], [3, 4, 1, 2])
+
+    def test_pure_recent_mode(self):
+        # Global flat MRU order: 4000 (t2_2), 3000 (t2_1), 2000 (t1_2), 1000 (t1_1)
+        res = fftabs.ordered(self.all_tabs, "recent")
+        self.assertEqual([t["id"] for t in res], [4, 3, 2, 1])
+
+        # Interleaved test:
+        t_mid = {
+            "id": 5, "index": 2, "title": "W1 Tab 2", "url": "https://e.com",
+            "lastAccessed": 3500, "window": {"id": 101, "n": 1, "focused": False},
+            "_profile_slug": "prof1"
+        }
+        interleaved = [self.t1_1, self.t1_2, self.t2_1, self.t2_2, t_mid]
+        # In recent: 4000 (t2_2), 3500 (t_mid), 3000 (t2_1), 2000 (t1_2), 1000 (t1_1)
+        res_int = fftabs.ordered(interleaved, "recent")
+        self.assertEqual([t["id"] for t in res_int], [4, 5, 3, 2, 1])
+
+        # But in window-recent: Window 2 still has max 4000, Window 1 has max 3500:
+        # Window 2 (4, 3), Window 1 (5, 2, 1)
+        res_win = fftabs.ordered(interleaved, "window-recent")
+        self.assertEqual([t["id"] for t in res_win], [4, 3, 5, 2, 1])
+
+    def test_window_num_mode(self):
+        # Orders by static window n: Window 1 (n=1) then Window 2 (n=2), tabs by index
+        res = fftabs.ordered(self.all_tabs, "window-num")
+        self.assertEqual([t["id"] for t in res], [1, 2, 3, 4])
+
+    def test_empty_tabs(self):
+        self.assertEqual(fftabs.ordered([], "window-recent"), [])
+        self.assertEqual(fftabs.ordered([], "recent"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -156,14 +156,24 @@ firefox         : host pid 711732  ok  profile=personal
 ### Interactive Rofi Switcher
 
 ```bash
-# Launch interactive tab picker (most recently accessed order)
+# Launch interactive tab picker (most recently viewed window first, MRU tabs inside)
 fftabs
 
 # Preselect the previously active tab (ideal for Alt+Tab shortcuts)
 fftabs rofi --previous
 
-# Order tabs by window and position rather than recent usage
-fftabs rofi --sort window
+# Sort options:
+# - window-recent (default): tabs of the most recently viewed window first; MRU inside
+fftabs rofi --sort window-recent
+
+# - recent: global flat MRU order across all windows and profiles
+fftabs rofi --sort recent
+
+# - window-index: most recently viewed window first; tabs in tab-bar order (index)
+fftabs rofi --sort window-index
+
+# - window-num: legacy static window number order (win 1, win 2...)
+fftabs rofi --sort window-num
 
 # Filter tabs to a specific profile
 fftabs rofi --profile work
