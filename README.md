@@ -205,10 +205,10 @@ fftabs close work:42
 
 ### Custom Themes
 
-A VS Code Command Palette-style theme (`vscode.rasi`) is included in the repository:
+You can customize Rofi's appearance by passing any standard Rofi `.rasi` theme:
 
 ```bash
-fftabs rofi -- -theme ./vscode.rasi
+fftabs rofi -- -theme ~/.config/rofi/my-theme.rasi
 ```
 
 ---
