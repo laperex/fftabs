@@ -36,7 +36,10 @@ from pathlib import Path
 try:
     import tomllib
 except ImportError:
-    tomllib = None
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
 
 HOST_NAME = "fftabs"
 ALLOWED_EXTENSIONS = ["fftabs@laperex"]
@@ -282,17 +285,26 @@ def load_config(path: Path | None = None) -> dict:
             cp.read(str(target), encoding="utf-8")
             for section in cp.sections():
                 sec_lower = section.lower()
-                if sec_lower in cfg:
+                sec_parts = sec_lower.split(".")
+                if len(sec_parts) == 2 and sec_parts[0] in cfg and isinstance(cfg[sec_parts[0]], dict):
+                    sub_dict = cfg[sec_parts[0]].setdefault(sec_parts[1], {})
+                    for key, val in cp.items(section):
+                        sub_dict[key] = val.strip().strip("\"'")
+                elif sec_lower in cfg:
                     for key, val in cp.items(section):
                         orig_val = cfg[sec_lower].get(key)
                         if isinstance(orig_val, bool):
                             cfg[sec_lower][key] = cp.getboolean(section, key)
                         elif isinstance(orig_val, int):
-                            cfg[sec_lower][key] = cp.getint(section, key)
+                            try:
+                                cfg[sec_lower][key] = cp.getint(section, key)
+                            except ValueError:
+                                cfg[sec_lower][key] = orig_val
                         elif isinstance(orig_val, list):
-                            cfg[sec_lower][key] = [x.strip() for x in val.split(",") if x.strip()]
+                            clean = val.strip().strip("[]")
+                            cfg[sec_lower][key] = [x.strip().strip("\"'") for x in clean.split(",") if x.strip()]
                         else:
-                            cfg[sec_lower][key] = val
+                            cfg[sec_lower][key] = val.strip().strip("\"'")
     except Exception as e:
         warn(f"error reading {target}: {e}")
     return cfg

@@ -610,6 +610,31 @@ close_others = ""
             # Untouched keys remain at default
             self.assertEqual(cfg["keybindings"]["close_right"], "Alt+r")
 
+    def test_toml_fallback_without_tomllib(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg_p = Path(td) / "config.toml"
+            cfg_p.write_text("""
+[general]
+default_sort = "recent"
+search_url = "https://google.com/search?q={query}"
+
+[history]
+enabled = false
+exclude_profiles = ["secret", "test"]
+
+[profiles.colors]
+work = "#ff5555"
+personal = "#50fa7b"
+""", encoding="utf-8")
+            with patch.object(fftabs, "tomllib", None):
+                cfg = fftabs.load_config(cfg_p)
+                self.assertEqual(cfg["general"]["default_sort"], "recent")
+                self.assertEqual(cfg["general"]["search_url"], "https://google.com/search?q={query}")
+                self.assertFalse(cfg["history"]["enabled"])
+                self.assertEqual(cfg["history"]["exclude_profiles"], ["secret", "test"])
+                self.assertEqual(cfg["profiles"]["colors"]["work"], "#ff5555")
+                self.assertEqual(cfg["profiles"]["colors"]["personal"], "#50fa7b")
+
     def test_history_exclude_profiles_and_patterns(self):
         with tempfile.TemporaryDirectory() as td:
             mock_cfg = {
@@ -648,10 +673,21 @@ close_others = ""
                 self.assertEqual(ret, 0)
                 cfg_file = Path(td) / "config.toml"
                 self.assertTrue(cfg_file.exists())
-                import tomllib
-                parsed = tomllib.loads(cfg_file.read_text(encoding="utf-8"))
-                self.assertIn("general", parsed)
-                self.assertIn("keybindings", parsed)
+                try:
+                    import tomllib
+                except ImportError:
+                    try:
+                        import tomli as tomllib
+                    except ImportError:
+                        tomllib = None
+                if tomllib is not None:
+                    parsed = tomllib.loads(cfg_file.read_text(encoding="utf-8"))
+                    self.assertIn("general", parsed)
+                    self.assertIn("keybindings", parsed)
+                else:
+                    content = cfg_file.read_text(encoding="utf-8")
+                    self.assertIn("[general]", content)
+                    self.assertIn("[keybindings]", content)
 
 
 class TestProfileColors(unittest.TestCase):
