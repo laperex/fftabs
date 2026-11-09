@@ -137,6 +137,11 @@ default_profile = ""
 # Completely ignore and hide these profiles from fftabs
 ignored_profiles = []
 
+[profiles.colors]
+# Custom colors for profile names in Rofi (hex codes, e.g. "#7aa2f7")
+# krishnadevk = "#7aa2f7"
+# laperex = "#9ece6a"
+
 [compositor]
 # Custom command to focus Firefox window ($FFTABS_TITLE is passed in env)
 # focus_cmd = ""
@@ -189,12 +194,40 @@ DEFAULT_CONFIG: dict = {
     "profiles": {
         "default_profile": "",
         "ignored_profiles": [],
+        "colors": {},
     },
     "compositor": {
         "focus_cmd": "",
         "disable_focus": False,
     },
 }
+
+PROFILE_COLOR_PALETTE = [
+    "#7aa2f7",  # soft blue
+    "#9ece6a",  # soft green
+    "#e0af68",  # warm gold
+    "#bb9af7",  # purple
+    "#f7768e",  # rose / pink
+    "#7dcfff",  # cyan
+    "#ff9e64",  # orange
+    "#2ac3de",  # teal
+    "#b4f9f8",  # ice
+    "#c0caf5",  # lavender
+]
+
+
+def profile_color(prof_name: str) -> str:
+    cfg_colors = get_config().get("profiles", {}).get("colors", {})
+    if prof_name in cfg_colors:
+        return cfg_colors[prof_name]
+    slug = slugify(prof_name)
+    if slug in cfg_colors:
+        return cfg_colors[slug]
+    for k, v in cfg_colors.items():
+        if k.lower() in (prof_name.lower(), slug.lower()):
+            return v
+    h = int(hashlib.sha256(slug.encode("utf-8")).hexdigest(), 16)
+    return PROFILE_COLOR_PALETTE[h % len(PROFILE_COLOR_PALETTE)]
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -1436,7 +1469,7 @@ def build_payload(tabs: list[dict], no_icons: bool) -> bytes:
         url = sanitize(t.get("url"))
         title = truncate(sanitize(t.get("title")) or url or "(untitled)", 90)
         site = site_of(url)
-        tags = [] if site == title else [site]
+        tags = [] if site == title else [html.escape(site, quote=False)]
         if t["current"]:
             tags.append("current")
         if t.get("pinned"):
@@ -1448,7 +1481,7 @@ def build_payload(tabs: list[dict], no_icons: bool) -> bytes:
         if t.get("discarded"):
             tags.append("unloaded")
         if t.get("container"):
-            tags.append(sanitize(t["container"]["name"]))
+            tags.append(html.escape(sanitize(t["container"]["name"]), quote=False))
         if t["window"].get("private"):
             tags.append("private")
 
@@ -1461,16 +1494,18 @@ def build_payload(tabs: list[dict], no_icons: bool) -> bytes:
 
         if multi_profile:
             prof_name = t.get("_profile_name", t["_pid"])
+            color = profile_color(prof_name)
+            styled_prof = f"<span foreground='{color}' weight='bold'>{html.escape(prof_name, quote=False)}</span>"
             if multi_win:
-                tags.append(f"{prof_name}/win {t['window']['n']}{pos_suffix}")
+                tags.append(f"{styled_prof}/win {t['window']['n']}{pos_suffix}")
             else:
-                tags.append(f"{prof_name}{pos_suffix}")
+                tags.append(f"{styled_prof}{pos_suffix}")
         elif multi_win:
             tags.append(f"win {t['window']['n']}{pos_suffix}")
         elif show_pos:
             tags.append(f"[{pos_tag}]")
         row = "{}  <span alpha='55%' size='small'>{}</span>".format(
-            html.escape(title, quote=False), html.escape(" \u00b7 ".join(tags), quote=False)
+            html.escape(title, quote=False), " \u00b7 ".join(tags)
         )
         opts: list[str] = []
         if not no_icons:

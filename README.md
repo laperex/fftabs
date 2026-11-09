@@ -341,6 +341,11 @@ default_url = "about:newtab"
 default_profile = ""                            # "" = show all connected profiles
 ignored_profiles = []                           # Profiles to hide from fftabs entirely
 
+[profiles.colors]
+# Custom colors for profile names in Rofi (hex codes, e.g. "#7aa2f7")
+# krishnadevk = "#7aa2f7"
+# laperex = "#9ece6a"
+
 [compositor]
 # focus_cmd = ""                                # Custom command to raise Firefox window
 disable_focus = false
@@ -477,6 +482,21 @@ Contributions, bug reports, and pull requests are welcome.
 - **Standard Library Only**: The CLI and host logic must remain dependency-free using the Python 3 standard library.
 - **Test Coverage**: When adding profile discovery logic, compositor backends, or CLI options, include corresponding unit tests in `tests/`.
 - **Code Style**: Keep Python code cleanly typed, structured, and formatted.
+
+---
+
+## Releases & CI/CD
+
+`fftabs` uses GitHub Actions for continuous integration and automated releases.
+
+### Automated Releases
+When a version tag is pushed (e.g. `git tag v0.2.0 && git push origin v0.2.0`), GitHub Actions will:
+1. Run all unit and integration tests across Python 3.10 through 3.13.
+2. Package the Firefox extension as a zip artifact (`fftabs-extension-v*.zip`).
+3. Package the standalone host bundle archive (`fftabs-v*.tar.gz`).
+4. Optionally sign the extension using Mozilla `web-ext` if repository secrets `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` are configured.
+5. Generate SHA-256 checksums (`SHA256SUMS.txt`).
+6. Publish a formal GitHub Release with changelog notes and downloadable assets.
 
 ---
 

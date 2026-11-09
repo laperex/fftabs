@@ -201,10 +201,10 @@ class TestMultiProfileIntegration(unittest.TestCase):
                 self.assertIn("personal:10", refs)
                 self.assertIn("personal:99", refs)
 
-                # Multi-profile rofi payload: tags show prefixed window
+                # Multi-profile rofi payload: tags show styled profile name and prefixed window
                 payload = fftabs.build_payload(tabs, no_icons=True).decode()
-                self.assertIn("Work/win 1", payload)
-                self.assertIn("Personal/win 1", payload)
+                self.assertIn(">Work</span>/win 1", payload)
+                self.assertIn(">Personal</span>/win 1", payload)
 
                 # Resolve ref by profile:ID
                 sp, tid = fftabs.resolve_ref("work:10")
@@ -652,6 +652,61 @@ close_others = ""
                 parsed = tomllib.loads(cfg_file.read_text(encoding="utf-8"))
                 self.assertIn("general", parsed)
                 self.assertIn("keybindings", parsed)
+
+
+class TestProfileColors(unittest.TestCase):
+    def test_deterministic_palette(self):
+        c1 = fftabs.profile_color("krishnadevk")
+        c2 = fftabs.profile_color("laperex")
+        self.assertTrue(c1.startswith("#"))
+        self.assertTrue(c2.startswith("#"))
+        self.assertNotEqual(c1, c2)
+        # Consistent across multiple calls
+        self.assertEqual(fftabs.profile_color("krishnadevk"), c1)
+
+    def test_config_override(self):
+        mock_cfg = {
+            "profiles": {
+                "colors": {
+                    "krishnadevk": "#112233",
+                    "my-prof": "#445566",
+                }
+            }
+        }
+        with patch("fftabs.get_config", return_value=mock_cfg):
+            self.assertEqual(fftabs.profile_color("krishnadevk"), "#112233")
+            self.assertEqual(fftabs.profile_color("My Prof"), "#445566")
+
+    def test_build_payload_styling(self):
+        tabs = [
+            {
+                "id": 1,
+                "index": 0,
+                "title": "Tab Title",
+                "url": "https://example.com",
+                "current": False,
+                "window": {"id": 10, "n": 1, "focused": False},
+                "_profile_name": "krishnadevk",
+                "_profile_slug": "krishnadevk",
+                "_pid": "100",
+            },
+            {
+                "id": 2,
+                "index": 0,
+                "title": "Other Title",
+                "url": "https://other.com",
+                "current": False,
+                "window": {"id": 20, "n": 1, "focused": False},
+                "_profile_name": "laperex",
+                "_profile_slug": "laperex",
+                "_pid": "200",
+            },
+        ]
+        payload = fftabs.build_payload(tabs, no_icons=True).decode()
+        c_k = fftabs.profile_color("krishnadevk")
+        c_l = fftabs.profile_color("laperex")
+        self.assertIn(f"<span foreground='{c_k}' weight='bold'>krishnadevk</span>", payload)
+        self.assertIn(f"<span foreground='{c_l}' weight='bold'>laperex</span>", payload)
 
 
 if __name__ == "__main__":
